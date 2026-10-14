@@ -28,6 +28,13 @@ import kotlinx.coroutines.sync.withLock
 import com.qingxu.app.core.ai.CloudDecisionClient
 import com.qingxu.app.core.ai.CloudRequestGuard
 import com.qingxu.app.core.ai.AiProvider
+import com.qingxu.app.core.ai.AiEndpointMode
+import com.qingxu.app.core.ai.AiAuthMode
+import com.qingxu.app.core.ai.AiConnectionDraft
+import com.qingxu.app.core.ai.AiConnectionTestStatus
+import com.qingxu.app.core.ai.AiServiceException
+import kotlinx.coroutines.Job
+import java.util.concurrent.atomic.AtomicLong
 import com.qingxu.app.core.privacy.deviceIsPrivate
 import com.qingxu.app.core.processing.AnalysisScheduler
 import com.qingxu.app.data.local.SourceKindRule
@@ -64,7 +71,10 @@ class QingxuViewModel(application: Application) : AndroidViewModel(application) 
     private val mutableAiStatus = MutableStateFlow("")
     val aiStatus = mutableAiStatus.asStateFlow()
     val rules = container.dao.observeRules().stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
-    private var testing = false
+    private val mutableConnectionTest = MutableStateFlow(AiConnectionTestStatus())
+    val connectionTest = mutableConnectionTest.asStateFlow()
+    private var connectionTestJob: Job? = null
+    private val connectionTestGeneration = AtomicLong()
 
     val state = combine(
         container.repository.entries.catch {
@@ -140,13 +150,15 @@ class QingxuViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
-    fun saveAi(endpoint: String, model: String, key: String?, enabled: Boolean, allowed: Set<String>, interests: String, provider: AiProvider) {
+    fun saveAi(endpoint: String, model: String, key: String?, enabled: Boolean, allowed: Set<String>, interests: String,
+        provider: AiProvider, endpointMode: AiEndpointMode, authMode: AiAuthMode) {
         if (!requirePrivateAccess()) return
+        connectionDraftChanged()
         viewModelScope.launch {
             try {
                 container.ensureStorageReady()
                 container.processor.gate.withLock {
-                    withContext(Dispatchers.IO) { container.ai.save(endpoint, model, key, enabled, allowed, interests, provider) }
+                    withContext(Dispatchers.IO) { container.ai.save(endpoint, model, key, enabled, allowed, interests, provider, endpointMode, authMode) }
                     container.processor.invalidatePolicy()
                     container.dao.requeueForPackages(container.sources.selected.value.toList())
                 }
@@ -158,34 +170,47 @@ class QingxuViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
-    fun clearAiKey() = write {
-        container.processor.gate.withLock {
-            container.processor.invalidatePolicy()
-            withContext(Dispatchers.IO) { container.ai.clearKey() }
-            container.dao.requeueForPackages(container.sources.selected.value.toList())
+    fun clearAiKey() {
+        if (!requirePrivateAccess()) return
+        connectionDraftChanged()
+        write {
+            container.processor.gate.withLock {
+                container.processor.invalidatePolicy()
+                withContext(Dispatchers.IO) { container.ai.clearKey() }
+                container.dao.requeueForPackages(container.sources.selected.value.toList())
+            }
+            mutableAiStatus.value = "已移除密钥并关闭云端分析"
+            AnalysisScheduler.enqueue(getApplication())
         }
-        mutableAiStatus.value = "已移除密钥并关闭云端分析"
-        AnalysisScheduler.enqueue(getApplication())
     }
 
-    fun testAi() {
+    fun connectionDraftChanged() {
+        connectionTestGeneration.incrementAndGet()
+        connectionTestJob?.cancel()
+        connectionTestJob = null
+        mutableConnectionTest.value = AiConnectionTestStatus()
+    }
+
+    fun testAi(draft: AiConnectionDraft) {
         if (!requirePrivateAccess()) return
         if (container.privacy.state.value.blockCloudWhenLocked && deviceIsPrivate(getApplication())) {
-            mutableAiStatus.value = "设备锁定时不发起连接测试"
+            mutableConnectionTest.value = AiConnectionTestStatus(message = "设备锁定时不发起连接测试", success = false)
             return
         }
-        if (testing) return
-        testing = true
-        mutableAiStatus.value = "正在发送固定虚构示例测试连接…"
-        viewModelScope.launch {
+        connectionDraftChanged()
+        val generation = connectionTestGeneration.get()
+        mutableConnectionTest.value = AiConnectionTestStatus(running = true, message = "正在测试当前填写的配置…")
+        connectionTestJob = viewModelScope.launch {
             try {
                 val sample = NotificationEntry("connection-test", "demo", "轻序虚构示例", "包裹已到达配送站",
                     "示例订单正在配送中，无需操作。", null, System.currentTimeMillis(), System.currentTimeMillis(), "demo")
-                val connection = withContext(Dispatchers.IO) { container.ai.connectionSnapshot() }
+                val connection = withContext(Dispatchers.IO) { container.ai.connectionSnapshot(draft) }
                 val privacyRevision = container.privacy.state.value.revision
                 val guard = CloudRequestGuard {
-                    if (container.ai.state.value.revision != connection.first.revision ||
+                    if (connectionTestGeneration.get() != generation ||
+                        container.ai.state.value.revision != connection.first.revision ||
                         container.privacy.state.value.revision != privacyRevision ||
+                        (container.privacy.state.value.hideContent && !container.contentSession.isUnlocked()) ||
                         (container.privacy.state.value.blockCloudWhenLocked && deviceIsPrivate(getApplication()))) {
                         throw ConnectionTestRevoked()
                     }
@@ -194,12 +219,25 @@ class QingxuViewModel(application: Application) : AndroidViewModel(application) 
                     guard.check()
                     CloudDecisionClient().classify(connection.first.copy(interests = ""), connection.second, sample)
                 }
-                mutableAiStatus.value = "连接成功，返回格式正确；未发送真实通知"
+                guard.check()
+                mutableConnectionTest.value = AiConnectionTestStatus(message = "连接成功，示例整理通过；未保存配置或开启上传。", success = true)
             } catch (_: ConnectionTestRevoked) {
-                mutableAiStatus.value = "设备状态或配置已变化，已停止连接测试"
+                if (connectionTestGeneration.get() == generation) mutableConnectionTest.value =
+                    AiConnectionTestStatus(message = "设备状态或配置已变化，已停止连接测试", success = false)
             } catch (cancelled: CancellationException) { throw cancelled
-            } catch (_: Exception) { mutableAiStatus.value = "连接测试失败，请检查已保存的地址、模型、密钥和服务状态"
-            } finally { testing = false }
+            } catch (error: AiServiceException) {
+                if (connectionTestGeneration.get() == generation) mutableConnectionTest.value =
+                    AiConnectionTestStatus(message = error.message ?: "服务测试失败", success = false)
+            } catch (error: IllegalArgumentException) {
+                if (connectionTestGeneration.get() == generation) mutableConnectionTest.value =
+                    AiConnectionTestStatus(message = error.message ?: "请检查当前配置", success = false)
+            } catch (_: Exception) {
+                if (connectionTestGeneration.get() == generation) mutableConnectionTest.value =
+                    AiConnectionTestStatus(message = "无法读取配置或连接服务，请重新填写密钥后重试。", success = false)
+            } finally {
+                if (connectionTestGeneration.get() == generation && mutableConnectionTest.value.running)
+                    mutableConnectionTest.value = AiConnectionTestStatus(message = "连接测试已停止", success = false)
+            }
         }
     }
 
@@ -222,7 +260,7 @@ class QingxuViewModel(application: Application) : AndroidViewModel(application) 
             container.dao.requeueForPackages(listOf(entry.packageName))
         }
         AnalysisScheduler.enqueue(getApplication())
-        messageChannel.send("已设为收起此应用的同类消息，可在智能整理设置中撤销")
+        messageChannel.send("已设为收起此应用的同类消息，可在高级设置中撤销")
     }
 
     fun removeRule(rule: SourceKindRule) = write {

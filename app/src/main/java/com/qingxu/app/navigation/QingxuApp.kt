@@ -33,6 +33,7 @@ fun QingxuApp(viewModel: QingxuViewModel, onUnlock: () -> Unit = {}, onPermissio
     val onboarding by viewModel.onboarding.collectAsStateWithLifecycle()
     val ai by viewModel.aiSettings.collectAsStateWithLifecycle()
     val aiStatus by viewModel.aiStatus.collectAsStateWithLifecycle()
+    val connectionTest by viewModel.connectionTest.collectAsStateWithLifecycle()
     val rules by viewModel.rules.collectAsStateWithLifecycle()
     val privacy by viewModel.privacySettings.collectAsStateWithLifecycle()
     val unlocked by viewModel.contentUnlocked.collectAsStateWithLifecycle()
@@ -47,6 +48,9 @@ fun QingxuApp(viewModel: QingxuViewModel, onUnlock: () -> Unit = {}, onPermissio
     val labels = listOf("收件箱", "已收起", "设置")
     val icons = listOf(Icons.Outlined.Inbox, Icons.Outlined.FilterAlt, Icons.Outlined.Tune)
     LaunchedEffect(viewModel) { viewModel.messages.collect { snackbar.showSnackbar(it) } }
+    LaunchedEffect(page, concealed) {
+        if (page != 3 || concealed) viewModel.connectionDraftChanged()
+    }
     BackHandler(page >= 3) { page = 2 }
     val tutorial: (@Composable () -> Unit)? = if (guiding && guideStep >= 2) {
         { OnboardingExample(onboarding, viewModel::classifyExample, viewModel::starExample, viewModel::restoreExample) }
@@ -95,7 +99,8 @@ fun QingxuApp(viewModel: QingxuViewModel, onUnlock: () -> Unit = {}, onPermissio
                     onRestartGuide = { viewModel.restartOnboarding(); viewModel.refresh(); page = 0 },
                     guideStep = if (guiding) guideStep else null)
                 3 -> if (concealed) PrivateSettingsGate(onUnlock) else AiSettingsScreen(ai, state.sourceApps, state.selectedPackages, aiStatus, rules,
-                    viewModel::saveAi, viewModel::testAi, viewModel::clearAiKey, viewModel::reanalyze, viewModel::removeRule, onPrivacySettings = { page = 4 })
+                    viewModel::saveAi, viewModel::testAi, viewModel::clearAiKey, viewModel::reanalyze, viewModel::removeRule,
+                    onPrivacySettings = { page = 4 }, testStatus = connectionTest, onConnectionChanged = viewModel::connectionDraftChanged)
                 4 -> if (concealed) PrivateSettingsGate(onUnlock) else PrivacySettingsScreen(privacy, state.sourceApps,
                     state.selectedPackages, privacyStatus, viewModel::savePrivacy, viewModel::deleteHistory, cloudEnabled = ai.enabled)
                 5 -> SourceSettingsScreen(state, onPermissionSettings, { packageName, selected ->

@@ -2,10 +2,16 @@ package com.qingxu.app.core.ai
 
 import java.io.ByteArrayOutputStream
 import java.net.SocketTimeoutException
+import java.net.UnknownHostException
+import java.net.ConnectException
+import java.net.URL
+import javax.net.ssl.SSLException
 import javax.net.ssl.HttpsURLConnection
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
@@ -14,16 +20,19 @@ import kotlin.coroutines.coroutineContext
 import org.json.JSONObject
 
 /** Shared bounded transport; errors contain no response text, message content, URL or credential. */
-internal class HttpsCloudTransport : CloudTransport {
+internal class HttpsCloudTransport(
+    private val openConnection: (URL) -> HttpsURLConnection = { it.openConnection() as HttpsURLConnection },
+) : CloudTransport {
     override suspend fun post(settings: AiSettings, key: String, payload: JSONObject): String =
         withContext(Dispatchers.IO) {
-            val uri = validateAiEndpoint(settings.endpoint, settings.provider)
+            val uri = resolveAiEndpoint(settings.endpoint, settings.provider, settings.endpointMode)
             require(settings.model.isNotBlank()) { "请先填写模型名称。" }
             require(key.isNotBlank() && key.length <= 8192 && key.none { it.isISOControl() }) {
                 "接口密钥不可用，请重新填写。"
             }
             var connection: HttpsURLConnection? = null
-            var watchdog: Job? = null
+            var watchdogScope: CoroutineScope? = null
+            val requestJob = checkNotNull(coroutineContext[Job])
             val deadline = System.nanoTime() + TOTAL_TIMEOUT_MS * 1_000_000
             fun remainingTimeout(): Int {
                 val remaining = (deadline - System.nanoTime()) / 1_000_000
@@ -33,11 +42,20 @@ internal class HttpsCloudTransport : CloudTransport {
             try {
                 ensureActive()
                 coroutineContext[CloudRequestGuard]?.check?.invoke()
-                connection = uri.toURL().openConnection() as HttpsURLConnection
+                connection = openConnection(uri.toURL())
                 val activeConnection = connection
-                watchdog = launch(Dispatchers.Default) {
-                    delay(TOTAL_TIMEOUT_MS)
-                    activeConnection.disconnect()
+                // Blocking URLConnection I/O does not observe coroutine cancellation. Keep this
+                // monitor independent of the request, and always close its scope in finally.
+                watchdogScope = CoroutineScope(Dispatchers.Default).also { scope ->
+                    scope.launch {
+                        while (requestJob.isActive) {
+                            val remainingNanos = deadline - System.nanoTime()
+                            if (remainingNanos <= 0) break
+                            val remainingMillis = (remainingNanos + 999_999) / 1_000_000
+                            delay(minOf(remainingMillis, CANCELLATION_POLL_MS))
+                        }
+                        runCatching { activeConnection.disconnect() }
+                    }
                 }
                 connection.requestMethod = "POST"
                 connection.instanceFollowRedirects = false
@@ -47,7 +65,7 @@ internal class HttpsCloudTransport : CloudTransport {
                 connection.doOutput = true
                 connection.setRequestProperty("Content-Type", "application/json; charset=utf-8")
                 connection.setRequestProperty("Accept", "application/json")
-                connection.setRequestProperty("Authorization", "Bearer $key")
+                connectionHeaders(settings, key).forEach { (name, value) -> connection.setRequestProperty(name, value) }
                 val bytesToSend = payload.toString().toByteArray(Charsets.UTF_8)
                 connection.setFixedLengthStreamingMode(bytesToSend.size)
                 connection.outputStream.use {
@@ -77,18 +95,21 @@ internal class HttpsCloudTransport : CloudTransport {
                 bytes.toString(Charsets.UTF_8.name())
             } catch (cancelled: CancellationException) {
                 throw cancelled
-            } catch (known: AiServiceException) {
-                throw known
-            } catch (_: SocketTimeoutException) {
-                throw AiServiceException("分析超时，本条通知已保留，请稍后重试。")
-            } catch (_: Exception) {
-                if (System.nanoTime() >= deadline) {
-                    throw AiServiceException("分析超时，本条通知已保留，请稍后重试。")
+            } catch (error: Exception) {
+                // disconnect() may surface as IOException; cancellation must remain cancellation.
+                ensureActive()
+                throw when {
+                    System.nanoTime() >= deadline || error is SocketTimeoutException ->
+                        AiServiceException("连接超时，请检查网络或稍后重试。")
+                    error is AiServiceException -> error
+                    error is UnknownHostException -> AiServiceException("无法解析服务域名，请检查地址和手机网络。")
+                    error is ConnectException -> AiServiceException("无法建立连接，请检查手机网络、代理或服务端口。")
+                    error is SSLException -> AiServiceException("HTTPS 证书或安全连接验证失败，请检查服务地址和设备时间。")
+                    else -> AiServiceException("暂时无法连接模型服务，本条通知已保留，请检查网络和接口配置。")
                 }
-                throw AiServiceException("暂时无法连接模型服务，本条通知已保留，请检查网络和接口配置。")
             } finally {
-                watchdog?.cancel()
-                connection?.disconnect()
+                watchdogScope?.cancel()
+                runCatching { connection?.disconnect() }
             }
         }
 
@@ -96,5 +117,6 @@ internal class HttpsCloudTransport : CloudTransport {
     private companion object {
         const val MAX_RESPONSE_BYTES = 65_536
         const val TOTAL_TIMEOUT_MS = 40_000L
+        const val CANCELLATION_POLL_MS = 100L
     }
 }

@@ -16,6 +16,7 @@ class CloudDecisionClient internal constructor(private val transport: CloudTrans
     suspend fun classify(settings: AiSettings, key: String, entry: NotificationEntry): Decision =
         when (settings.provider) {
             AiProvider.CHAT_COMPLETIONS -> AiClient(transport).classify(settings, key, entry)
+            AiProvider.ANTHROPIC_MESSAGES -> AnthropicClient(transport).classify(settings, key, entry)
             AiProvider.JEV -> JevClient(transport).classify(settings, key, entry)
         }
 }

@@ -13,7 +13,9 @@ import javax.crypto.spec.GCMParameterSpec
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
-enum class AiProvider { CHAT_COMPLETIONS, JEV }
+enum class AiProvider { CHAT_COMPLETIONS, ANTHROPIC_MESSAGES, JEV }
+enum class AiEndpointMode { BASE_URL, FULL_URL }
+enum class AiAuthMode { API_KEY, BEARER }
 
 data class AiSettings(
     val endpoint: String = "",
@@ -24,6 +26,8 @@ data class AiSettings(
     val hasKey: Boolean = false,
     val revision: Long = 0,
     val provider: AiProvider = AiProvider.CHAT_COMPLETIONS,
+    val endpointMode: AiEndpointMode = AiEndpointMode.BASE_URL,
+    val authMode: AiAuthMode = AiAuthMode.API_KEY,
 )
 
 /** Complete HTTPS endpoint. The Jev adapter deliberately supports the official service only. */
@@ -71,12 +75,14 @@ class AiPreferences(context: Context) {
         allowedPackages: Set<String>,
         interests: String,
         provider: AiProvider = mutableState.value.provider,
+        endpointMode: AiEndpointMode = mutableState.value.endpointMode,
+        authMode: AiAuthMode = mutableState.value.authMode,
     ) {
         val cleanEndpoint = endpoint.trim()
         val cleanModel = model.trim()
         val cleanInterests = interests.trim()
         val replacementKey = key?.trim()?.takeIf { it.isNotBlank() }
-        if (cleanEndpoint.isNotBlank()) validateAiEndpoint(cleanEndpoint, provider)
+        if (cleanEndpoint.isNotBlank()) resolveAiEndpoint(cleanEndpoint, provider, endpointMode)
         require(cleanModel.length <= 200 && cleanModel.none { it.isISOControl() }) { "模型名称格式不正确。" }
         require(cleanInterests.length <= 2000) { "关注内容请控制在 2000 字以内。" }
         if (replacementKey != null) {
@@ -86,7 +92,8 @@ class AiPreferences(context: Context) {
         }
         if (mutableState.value.hasKey && replacementKey == null &&
             (provider != mutableState.value.provider ||
-                endpointAuthority(cleanEndpoint) != endpointAuthority(mutableState.value.endpoint))
+                endpointAuthority(cleanEndpoint) != endpointAuthority(mutableState.value.endpoint) ||
+                (provider == AiProvider.ANTHROPIC_MESSAGES && authMode != mutableState.value.authMode))
         ) {
             throw IllegalArgumentException("更换服务类型或地址时请重新填写该服务的密钥，或先删除原密钥。")
         }
@@ -105,6 +112,8 @@ class AiPreferences(context: Context) {
             hasKey = hasKey,
             revision = mutableState.value.revision,
             provider = provider,
+            endpointMode = endpointMode,
+            authMode = authMode,
         )
         if (replacementKey == null && next == mutableState.value) return
 
@@ -124,6 +133,8 @@ class AiPreferences(context: Context) {
         val committed = editor.putString("endpoint", next.endpoint)
             .putString("model", next.model)
             .putString("provider", next.provider.name)
+            .putString("endpoint_mode", next.endpointMode.name)
+            .putString("auth_mode", next.authMode.name)
             .putBoolean("enabled", next.enabled)
             .putStringSet("allowed_packages", next.allowedPackages)
             .putString("interests", next.interests)
@@ -164,6 +175,21 @@ class AiPreferences(context: Context) {
     @Synchronized
     fun connectionSnapshot(): Pair<AiSettings, String> = mutableState.value to apiKey()
 
+    /** Resolve unsaved input without saving, enabling uploads or reusing another service's secret. */
+    @Synchronized
+    fun connectionSnapshot(draft: AiConnectionDraft): Pair<AiSettings, String> {
+        val next = draftSettings(draft)
+        val newKey = draft.key?.trim()?.takeIf { it.isNotEmpty() }
+        require(newKey != null || canReuseSavedKey(mutableState.value, draft)) {
+            "请填写当前服务的密钥；更换服务或鉴权方式后不能沿用旧密钥。"
+        }
+        val key = newKey ?: apiKey()
+        require(key.isNotBlank() && key.length <= 8192 && key.none { it.isISOControl() }) {
+            "密钥格式不正确，请检查是否含有换行。"
+        }
+        return next.copy(revision = mutableState.value.revision) to key
+    }
+
     private fun readSettings() = AiSettings(
         endpoint = preferences.getString("endpoint", "").orEmpty(),
         model = preferences.getString("model", "").orEmpty(),
@@ -174,6 +200,11 @@ class AiPreferences(context: Context) {
         revision = preferences.getLong("revision", 0),
         provider = AiProvider.entries.firstOrNull { it.name == preferences.getString("provider", null) }
             ?: AiProvider.CHAT_COMPLETIONS,
+        // Existing installations stored complete endpoints. Do not reinterpret them during upgrade.
+        endpointMode = AiEndpointMode.entries.firstOrNull { it.name == preferences.getString("endpoint_mode", null) }
+            ?: if (preferences.contains("endpoint")) AiEndpointMode.FULL_URL else AiEndpointMode.BASE_URL,
+        authMode = AiAuthMode.entries.firstOrNull { it.name == preferences.getString("auth_mode", null) }
+            ?: AiAuthMode.API_KEY,
     )
 
     private fun encryptionKey(): SecretKey {
@@ -198,7 +229,7 @@ class AiPreferences(context: Context) {
     }
 }
 
-private fun endpointAuthority(endpoint: String): String = try {
+internal fun endpointAuthority(endpoint: String): String = try {
     val uri = URI(endpoint)
     "${uri.host?.lowercase()}:${if (uri.port == -1) 443 else uri.port}"
 } catch (_: Exception) {

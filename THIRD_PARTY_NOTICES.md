@@ -19,5 +19,6 @@
 - [qq-live-digest](https://github.com/wc985732-lang/qq-live-digest)：通知过滤与摘要的产品讨论起点。此仓库是独立的 Android 实现，不是该项目的 Git fork。
 - [Things](https://culturedcode.com/things/) 与 [Material 3](https://m3.material.io/)：信息层级与原生交互参考。
 - [Android Compose Samples](https://github.com/android/compose-samples)、[compose-intro-showcase](https://github.com/canopas/compose-intro-showcase) 和 [Reveal](https://github.com/svenjacobs/reveal)：消息界面、动效与贴近控件的引导参考。
+- [CC Switch](https://github.com/farion1231/cc-switch)：0.4.3 的协议选择、基础 URL／完整 URL 与 Claude 鉴权配置参考。其项目采用 [MIT 许可证](https://github.com/farion1231/cc-switch/blob/main/LICENSE)；轻序独立实现连接与解析逻辑，未复制其实现代码，也不读取本机 CC Switch 的配置或凭据。
 
-参考链接不表示品牌合作或授权背书。当前项目的界面实现没有复制上述参考项目的源码。
+参考链接不表示品牌合作或授权背书。当前项目的界面实现没有复制上述参考项目的源码。轻序的连接测试会提交固定虚构通知并校验分类响应，网址可达本身不算测试通过。

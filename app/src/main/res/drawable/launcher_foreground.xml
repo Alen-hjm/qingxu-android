@@ -1,0 +1,3 @@
+<inset xmlns:android="http://schemas.android.com/apk/res/android" android:inset="20%">
+    <bitmap android:src="@drawable/qingxu_face" android:gravity="fill" />
+</inset>

@@ -1,0 +1,9 @@
+<resources>
+    <style name="Theme.Qingxu" parent="android:style/Theme.Material.NoActionBar">
+        <item name="android:fontFamily">sans</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowBackground">@color/brand_background</item>
+        <item name="android:statusBarColor">@color/brand_background</item>
+        <item name="android:navigationBarColor">@color/brand_background</item>
+    </style>
+</resources>

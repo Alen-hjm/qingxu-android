@@ -1,0 +1,10 @@
+<resources>
+    <style name="Theme.Qingxu" parent="android:style/Theme.Material.NoActionBar">
+        <item name="android:fontFamily">sans</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowBackground">@color/brand_background</item>
+        <item name="android:windowSplashScreenBackground">@color/brand_background</item>
+        <item name="android:windowSplashScreenAnimatedIcon">@drawable/launcher_foreground</item>
+        <item name="android:windowActionModeOverlay">true</item>
+    </style>
+</resources>

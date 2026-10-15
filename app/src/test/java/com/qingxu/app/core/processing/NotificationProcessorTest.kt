@@ -78,14 +78,28 @@ class NotificationProcessorTest {
         processor.processBatch(0)
         assertEquals(DecisionBucket.LATER, dao.find("star")!!.effectiveBucket())
     }
-    @Test fun ruleIsLimitedToSourceAndKind() = runBlocking {
+    @Test fun legacyNonMarketingRuleCannotHideDeliveryOrUrgentTransaction() = runBlocking {
         capture("refund", "退款失败，请补充资料")
         capture("delivery", "包裹已到配送站")
         dao.saveRule(SourceKindRule("com.taobao.taobao", "delivery", true))
+        dao.saveRule(SourceKindRule("com.taobao.taobao", "transaction", true))
         processor.processBatch(0)
         assertEquals(DecisionBucket.NOW, dao.find("refund")!!.effectiveBucket())
-        assertEquals(DecisionBucket.HIDDEN, dao.find("delivery")!!.effectiveBucket())
-        assertEquals("preference", dao.find("delivery")!!.analysisSource)
+        assertEquals(DecisionBucket.LATER, dao.find("delivery")!!.effectiveBucket())
+        assertEquals("local", dao.find("delivery")!!.analysisSource)
+    }
+
+    @Test fun marketingPreferenceCannotHideMixedOrInsufficientContentAndInterestsRemainVisible() = runBlocking {
+        dao.saveRule(SourceKindRule("com.taobao.taobao", "marketing", true))
+        preferences.save("", "", null, false, emptySet(), "摄影")
+        capture("mixed-preference", "订单已发货，限时优惠券待领取")
+        capture("pure-preference", "限时优惠，马上抢购")
+        capture("interest-preference", "摄影限时优惠")
+        processor.processBatch(0)
+        assertEquals(DecisionBucket.LATER, dao.find("mixed-preference")!!.effectiveBucket())
+        assertEquals(DecisionBucket.HIDDEN, dao.find("pure-preference")!!.effectiveBucket())
+        assertEquals("preference", dao.find("pure-preference")!!.analysisSource)
+        assertEquals(DecisionBucket.LATER, dao.find("interest-preference")!!.effectiveBucket())
     }
     @Test fun verificationCodeAndDisabledSourceRemainVisible() = runBlocking {
         capture("otp", "验证码123456，限时优惠")
@@ -194,6 +208,75 @@ class NotificationProcessorTest {
         assertEquals(result.contentVersion, result.manualVersion)
         assertEquals("unknown", result.machineKind)
         assertEquals(1, calls)
+    }
+
+    @Test fun completionDuringCloudRequestCannotBeChangedByItsLateResult() = runBlocking {
+        lateinit var beforeCompletion: NotificationEntry
+        withPausedCloud("handled-cloud") {
+            beforeCompletion = dao.find("handled-cloud")!!
+            assertEquals(1, dao.setHandled(beforeCompletion.notificationKey, true,
+                beforeCompletion.contentVersion, beforeCompletion.contentHash))
+        }
+        val handled = dao.find("handled-cloud")!!
+        assertNotNull(handled.handledAt)
+        assertEquals(beforeCompletion.machineBucket, handled.machineBucket)
+        assertEquals(beforeCompletion.machineReason, handled.machineReason)
+        assertEquals(beforeCompletion.analysisSource, handled.analysisSource)
+        assertEquals(0, dao.pendingCount())
+        assertFalse(processor.processBatch(0))
+        assertEquals(1, calls)
+    }
+
+    @Test fun explicitConversationPreferencePrioritizesOnlyReadableMatchingChatLocally() = runBlocking {
+        sources.setSelected("com.tencent.mm", true)
+        sources.setSelected("com.tencent.mobileqq", true)
+        val now = System.currentTimeMillis()
+        suspend fun chat(key: String, title: String, body: String, pkg: String = "com.tencent.mm") {
+            dao.capture(CapturedNotification(key, pkg, if (pkg == "com.tencent.mm") "微信" else "QQ",
+                title, body, null, now, now, "$title:$body"))
+        }
+        chat("preferred-chat", "妈妈", "今天晚点回家吃饭")
+        val first = dao.find("preferred-chat")!!
+        dao.savePrioritySender(SenderPriorityRule(first.packageName, SenderPreferencePolicy.senderScope(first)!!))
+        chat("next-chat", "妈妈", "到家给我发个消息")
+        chat("other-chat", "同事", "周末一起吃饭吧")
+        chat("other-app", "妈妈", "今天晚点回家吃饭", "com.tencent.mobileqq")
+        chat("hidden-chat", "妈妈", "解锁后查看消息")
+        processor.processBatch(0)
+        assertEquals(DecisionBucket.NOW, dao.find("preferred-chat")!!.effectiveBucket())
+        assertEquals(DecisionBucket.NOW, dao.find("next-chat")!!.effectiveBucket())
+        assertEquals("preference", dao.find("next-chat")!!.analysisSource)
+        assertTrue(dao.find("next-chat")!!.machineReason.contains("这个会话"))
+        assertEquals(DecisionBucket.LATER, dao.find("other-chat")!!.effectiveBucket())
+        assertEquals(DecisionBucket.LATER, dao.find("other-app")!!.effectiveBucket())
+        assertEquals(DecisionBucket.REVIEW, dao.find("hidden-chat")!!.effectiveBucket())
+        assertEquals(0, calls)
+    }
+
+    @Test fun conversationPreferenceDoesNotOverrideManualCorrectionOrCompletionAndKeepsSafetyReason() = runBlocking {
+        sources.setSelected("com.tencent.mm", true)
+        val now = System.currentTimeMillis()
+        suspend fun chat(key: String, body: String) {
+            dao.capture(CapturedNotification(key, "com.tencent.mm", "微信", "家人", body, null, now, now, body))
+        }
+        chat("manual-chat", "今天晚点回家吃饭")
+        val first = dao.find("manual-chat")!!
+        dao.savePrioritySender(SenderPriorityRule(first.packageName, SenderPreferencePolicy.senderScope(first)!!))
+        dao.classify("manual-chat", UserLabel.IMPORTANT)
+        chat("handled-chat", "已到家，晚安")
+        val done = dao.find("handled-chat")!!
+        dao.setHandled(done.notificationKey, true, done.contentVersion, done.contentHash)
+        chat("risk-chat", "我在急诊，你来一下")
+        dao.saveRule(SourceKindRule("com.tencent.mm", "message", true))
+        dao.saveRule(SourceKindRule("com.tencent.mm", "medical", true))
+        processor.processBatch(0)
+        assertEquals(DecisionBucket.LATER, dao.find("manual-chat")!!.effectiveBucket())
+        assertEquals("manual", dao.find("manual-chat")!!.analysisSource.ifBlank { dao.find("manual-chat")!!.labelSource })
+        assertNotNull(dao.find("handled-chat")!!.handledAt)
+        assertEquals(DecisionBucket.REVIEW, dao.find("handled-chat")!!.effectiveBucket())
+        assertEquals(DecisionBucket.NOW, dao.find("risk-chat")!!.effectiveBucket())
+        assertEquals("medical", dao.find("risk-chat")!!.machineKind)
+        assertEquals("local", dao.find("risk-chat")!!.analysisSource)
     }
 
     @Test fun updatedNotificationContentCannotReceiveThePreviousContentsCloudResult() = runBlocking {

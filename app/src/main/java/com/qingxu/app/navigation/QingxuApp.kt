@@ -22,27 +22,32 @@ import com.qingxu.app.feature.settings.SettingsScreen
 import com.qingxu.app.feature.settings.SourceSettingsScreen
 import com.qingxu.app.feature.settings.AiSettingsScreen
 import com.qingxu.app.feature.settings.PrivacySettingsScreen
+import com.qingxu.app.feature.settings.PriorityPreferencesDialog
 import androidx.activity.compose.BackHandler
 import com.qingxu.app.feature.onboarding.GuideDock
 import com.qingxu.app.feature.onboarding.OnboardingExample
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun QingxuApp(viewModel: QingxuViewModel, onUnlock: () -> Unit = {}, onPermissionSettings: () -> Unit) {
+fun QingxuApp(viewModel: QingxuViewModel, onUnlock: () -> Unit = {}, onPermissionSettings: () -> Unit,
+    onNotificationPermission: (Boolean, () -> Unit) -> Unit = { _, action -> action() }) {
     val state by viewModel.state.collectAsStateWithLifecycle()
     val onboarding by viewModel.onboarding.collectAsStateWithLifecycle()
     val ai by viewModel.aiSettings.collectAsStateWithLifecycle()
     val aiStatus by viewModel.aiStatus.collectAsStateWithLifecycle()
     val connectionTest by viewModel.connectionTest.collectAsStateWithLifecycle()
     val rules by viewModel.rules.collectAsStateWithLifecycle()
+    val priorityRules by viewModel.prioritySenders.collectAsStateWithLifecycle()
+    val surfaceSettings by viewModel.surfaceSettings.collectAsStateWithLifecycle()
     val privacy by viewModel.privacySettings.collectAsStateWithLifecycle()
     val unlocked by viewModel.contentUnlocked.collectAsStateWithLifecycle()
     val privacyStatus by viewModel.privacyStatus.collectAsStateWithLifecycle()
     val concealed = privacy.hideContent && !unlocked
     var page by rememberSaveable { mutableIntStateOf(0) }
-    val guideStep = onboarding.step(state.selectedPackages.isNotEmpty(), state.permissionGranted)
+    var managingPriority by rememberSaveable { mutableStateOf(false) }
+    val guideStep = onboarding.step(state.selectedPackages.isNotEmpty(), state.permissionGranted, state.listenerConnected)
     val guiding = !onboarding.completed && !state.loading
-    val targetPage = when (guideStep) { 0, 1 -> 5; 3 -> 1; else -> 0 }
+    val targetPage = when (guideStep) { 0, 1 -> 5; else -> 0 }
     val targetTab = if (targetPage >= 2) 2 else targetPage
     val snackbar = remember { SnackbarHostState() }
     val labels = listOf("收件箱", "已收起", "设置")
@@ -53,7 +58,7 @@ fun QingxuApp(viewModel: QingxuViewModel, onUnlock: () -> Unit = {}, onPermissio
     }
     BackHandler(page >= 3) { page = 2 }
     val tutorial: (@Composable () -> Unit)? = if (guiding && guideStep >= 2) {
-        { OnboardingExample(onboarding, viewModel::classifyExample, viewModel::starExample, viewModel::restoreExample) }
+        { OnboardingExample(onboarding, viewModel::classifyExample, viewModel::starExample, viewModel::restoreExample, onDemo = viewModel::demoExample) }
     } else null
     Scaffold(
         topBar = {
@@ -91,26 +96,37 @@ fun QingxuApp(viewModel: QingxuViewModel, onUnlock: () -> Unit = {}, onPermissio
                     onClassify = viewModel::classify, onInterest = viewModel::toggleInterest,
                     onOpen = viewModel::openOriginal, tutorial = if (targetPage == 0) tutorial else null,
                     onHideSimilar = viewModel::hideSimilar, concealContent = concealed, onUnlock = onUnlock,
-                    onReconnect = viewModel::reconnectNotifications)
+                    onReconnect = viewModel::reconnectNotifications, onHandled = viewModel::setHandled,
+                    onPrioritizeSender = viewModel::prioritizeSender, onTestNotification = { onNotificationPermission(false, viewModel::testNotification) })
                 1 -> FilteredScreen(state.entries, viewModel::restore, viewModel::toggleInterest,
                     tutorial = if (targetPage == 1) tutorial else null, onHideSimilar = viewModel::hideSimilar,
-                    concealContent = concealed, onUnlock = onUnlock)
+                    concealContent = concealed, onUnlock = onUnlock, onOpen = viewModel::openOriginal,
+                    onHandled = viewModel::setHandled, onPrioritizeSender = viewModel::prioritizeSender)
                 2 -> SettingsScreen(state, onSources = { page = 5; viewModel.refresh() },
                     onPrivacySettings = { page = 4 }, onAdvancedSettings = { page = 3 }, hideContent = privacy.hideContent,
                     onRestartGuide = { viewModel.restartOnboarding(); viewModel.refresh(); page = 0 },
-                    guideStep = if (guiding) guideStep else null)
+                    guideStep = if (guiding) guideStep else null, surfaceSettings = surfaceSettings,
+                    onSurfaceChange = { summary, remove ->
+                        if (concealed) onUnlock()
+                        else if (summary && !surfaceSettings.summary) onNotificationPermission(true) { viewModel.saveSurface(summary, remove) }
+                        else viewModel.saveSurface(summary, remove)
+                    }, priorityCount = priorityRules.size, onManagePriority = { if (concealed) onUnlock() else managingPriority = true })
                 3 -> if (concealed) PrivateSettingsGate(onUnlock) else AiSettingsScreen(ai, state.sourceApps, state.selectedPackages, aiStatus, rules,
                     viewModel::saveAi, viewModel::testAi, viewModel::clearAiKey, viewModel::reanalyze, viewModel::removeRule,
-                    onPrivacySettings = { page = 4 }, testStatus = connectionTest, onConnectionChanged = viewModel::connectionDraftChanged)
+                    onPrivacySettings = { page = 4 }, testStatus = connectionTest, onConnectionChanged = viewModel::connectionDraftChanged,
+                    localOnlyPackages = privacy.localOnlyPackages)
                 4 -> if (concealed) PrivateSettingsGate(onUnlock) else PrivacySettingsScreen(privacy, state.sourceApps,
                     state.selectedPackages, privacyStatus, viewModel::savePrivacy, viewModel::deleteHistory, cloudEnabled = ai.enabled)
                 5 -> SourceSettingsScreen(state, onPermissionSettings, { packageName, selected ->
                     if (selected && concealed) onUnlock() else viewModel.selectSource(packageName, selected)
                 }, guideStep = if (guiding) guideStep else null, requiresUnlock = concealed, onUnlock = onUnlock,
-                    onReconnect = viewModel::reconnectNotifications)
+                    onReconnect = viewModel::reconnectNotifications, privacySettings = privacy, aiSettings = ai,
+                    onTestNotification = { onNotificationPermission(false, viewModel::testNotification) })
             }
         }
     }
+    if (managingPriority && !concealed) PriorityPreferencesDialog(priorityRules, state.entries,
+        onRemove = viewModel::removePriority, onDismiss = { managingPriority = false })
 }
 
 @Composable

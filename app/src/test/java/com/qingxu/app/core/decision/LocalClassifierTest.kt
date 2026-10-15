@@ -4,6 +4,8 @@ import com.qingxu.app.data.local.NotificationEntry
 import com.qingxu.app.data.local.UserLabel
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class LocalClassifierTest {
@@ -88,5 +90,60 @@ class LocalClassifierTest {
         assertEquals(DecisionBucket.LATER, LocalClassifier.fallback(entry("周末一起吃饭吧").copy(title = "新消息")).bucket)
         assertEquals(DecisionBucket.LATER, LocalClassifier.fallback(entry("你关注的作者更新了一篇文章")).bucket)
         assertEquals(DecisionBucket.LATER, LocalClassifier.classify(entry("支付成功，已扣款20元"))!!.bucket)
+    }
+
+    @Test fun safetyAndMedicalHelpInChatAreCheckedBeforeOrdinaryMessageFallback() {
+        val chat = entry("我在急诊，你来一下", "com.tencent.mm", "微信")
+        for (body in listOf("我在急诊，你来一下", "妈妈突然昏倒了，快过来", "我喘不过气，请叫120", "家里着火了，快报警", "账号被盗了")) {
+            val result = LocalClassifier.classify(chat.copy(body = body), now = 2L)!!
+            assertEquals(body, DecisionBucket.NOW, result.bucket)
+            assertTrue(result.kind in setOf("medical", "security"))
+        }
+        assertEquals(DecisionBucket.NOW, LocalClassifier.classify(chat.copy(body = "我在急诊，你来一下。不着急带东西"), now = 2L)!!.bucket)
+    }
+
+    @Test fun negatedQuotedHistoricalAndPromotionalRisksDoNotClaimAnImmediateEmergency() {
+        val chat = entry("", "com.tencent.mm", "微信")
+        for (body in listOf("我没有呼吸困难，只是累了", "我不在急诊，不用过来", "我不在急诊，你来一下", "没有燃气泄漏，已确认安全", "火灾警报已解除", "转发一篇科普：呼吸困难怎么办，赶快了解", "电影台词：我在急诊，你来一下", "如果发生燃气泄漏，请立即联系物业", "燃气泄漏保险限时优惠，马上购买", "昨天我在急诊，你来一下")) {
+            assertNull(body, LocalClassifier.classify(chat.copy(body = body), now = 2L))
+        }
+        assertEquals(DecisionBucket.LATER,
+            LocalClassifier.classify(chat.copy(body = "我在急诊，你来一下"), now = 31 * 60_000L)!!.bucket)
+    }
+
+    @Test fun defaultVisiblePlacementDoesNotCountAsConfidentUnderstanding() {
+        val ordinary = entry("周末一起吃饭吧", "com.tencent.mm", "微信")
+        val fallback = LocalClassifier.fallback(ordinary)
+        val organized = ordinary.copy(machineBucket = fallback.bucket.name, machineKind = fallback.kind,
+            machineConfidence = fallback.confidence, analysisSource = "local")
+        assertFalse(organized.isConfidentlyOrganized())
+        val explicit = organized.copy(machineBucket = "NOW", machineKind = "medical", machineConfidence = 0.94)
+        assertTrue(explicit.isConfidentlyOrganized())
+        assertFalse(explicit.copy(handledAt = 100L).isConfidentlyOrganized())
+        assertFalse(explicit.copy(labelSource = "manual", manualVersion = 1).isConfidentlyOrganized())
+        assertFalse(explicit.copy(machineConfidence = Double.NaN).isConfidentlyOrganized())
+    }
+
+    @Test fun longTermHidingIsOnlyEligibleForHighConfidencePureMarketing() {
+        assertTrue(Decision(DecisionBucket.HIDDEN, "marketing", "", 0.99).isLongTermHideEligible())
+        assertFalse(Decision(DecisionBucket.NOW, "marketing", "", 0.99).isLongTermHideEligible())
+        assertFalse(Decision(DecisionBucket.LATER, "delivery", "", 0.99).isLongTermHideEligible())
+        assertFalse(Decision(DecisionBucket.HIDDEN, "marketing", "", 0.9).isLongTermHideEligible())
+    }
+
+    @Test fun expiredTimeBoundSignalsLeaveNowWithoutChangingManualOrConversationPriority() {
+        val base = entry("会议将在10分钟后开始").copy(machineBucket = "NOW", analysisSource = "local")
+        val later = 31 * 60_000L
+        for (kind in listOf("verification", "event", "message", "security", "medical")) {
+            val notification = base.copy(machineKind = kind)
+            assertEquals(DecisionBucket.NOW, notification.displayBucket(now = 2L))
+            assertEquals(DecisionBucket.LATER, notification.displayBucket(now = later))
+            assertTrue(notification.displayReason(later).contains("较早"))
+        }
+        assertEquals(DecisionBucket.NOW, base.copy(machineKind = "transaction").displayBucket(later))
+        assertEquals(DecisionBucket.NOW, base.copy(machineKind = "message", analysisSource = "preference").displayBucket(later))
+        assertEquals(DecisionBucket.NOW, base.copy(machineKind = "verification", labelSource = "manual",
+            userLabel = UserLabel.IMPORTANT_URGENT, manualVersion = 1).displayBucket(later))
+        assertEquals(DecisionBucket.LATER, base.copy(machineKind = "event", postedAt = later).displayBucket(now = 1L))
     }
 }

@@ -37,6 +37,26 @@ class OnboardingPreferencesTest {
         assertTrue(OnboardingPreferences(context).state.value.completed)
     }
 
+    @Test fun automaticDemoCompletesPracticeWithoutManualClassification() {
+        guide.demo()
+        val reopened = OnboardingPreferences(context)
+        assertEquals(2, reopened.state.value.practice)
+        assertEquals(UserLabel.UNSORTED, reopened.state.value.label)
+        assertEquals(4, reopened.state.value.step(true, true, true))
+        assertFalse(reopened.state.value.completed)
+        reopened.complete()
+        assertTrue(OnboardingPreferences(context).state.value.completed)
+    }
+
+    @Test fun notificationPermissionAloneCannotCompleteConnectionStep() {
+        guide.demo()
+        assertEquals(1, guide.state.value.step(true, true, false))
+        assertEquals(4, guide.state.value.step(true, true, true))
+        assertEquals(1, guide.state.value.step(true, false, true))
+        assertEquals(0, guide.state.value.step(false, true, true))
+        assertEquals(2, guide.state.value.practice)
+    }
+
     @Test fun optionalActionsDoNotSkipCorrectionAndRepeatedTapDoesNotAdvance() {
         guide.star()
         guide.restore()

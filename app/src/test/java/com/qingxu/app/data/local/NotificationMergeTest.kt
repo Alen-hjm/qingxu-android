@@ -74,4 +74,13 @@ class NotificationMergeTest {
         assertEquals("NOW", result.machineBucket)
         assertEquals("done", result.analysisStatus)
     }
+
+    @Test fun duplicateSnapshotPreservesCompletionButChangedContentReturnsToInbox() {
+        val handled = mergeNotification(null, capture()).copy(handledAt = 200L)
+        assertEquals(200L, mergeNotification(handled, capture().copy(capturedAt = 300L)).handledAt)
+        val changed = mergeNotification(handled, capture("hash-2", "新的待办事项"))
+        assertNull(changed.handledAt)
+        assertEquals(2, changed.contentVersion)
+        assertEquals("pending", changed.analysisStatus)
+    }
 }

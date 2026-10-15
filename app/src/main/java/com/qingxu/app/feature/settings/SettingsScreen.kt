@@ -17,6 +17,7 @@ import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import com.qingxu.app.feature.QingxuUiState
+import com.qingxu.app.notification.SurfaceSettings
 
 /** Everyday choices only. Collection and optional service configuration have their own pages. */
 @Composable
@@ -28,6 +29,10 @@ fun SettingsScreen(
     onRestartGuide: () -> Unit,
     hideContent: Boolean = true,
     guideStep: Int? = null,
+    surfaceSettings: SurfaceSettings = SurfaceSettings(),
+    onSurfaceChange: (Boolean, Boolean) -> Unit = { _, _ -> },
+    priorityCount: Int = 0,
+    onManagePriority: () -> Unit = {},
 ) {
     LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(20.dp),
         verticalArrangement = Arrangement.spacedBy(24.dp)) {
@@ -46,6 +51,34 @@ fun SettingsScreen(
                         Icons.Outlined.Lock, onPrivacySettings)
                 }
             }
+        }
+        item {
+            Surface(shape = RoundedCornerShape(20.dp), color = MaterialTheme.colorScheme.surface) {
+                Column(Modifier.padding(horizontal = 16.dp, vertical = 8.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Column(Modifier.weight(1f)) {
+                            Text("通知栏摘要", style = MaterialTheme.typography.titleSmall)
+                            Text("静默显示优先消息数量，点开即看", style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                        Switch(surfaceSettings.summary, { onSurfaceChange(it, surfaceSettings.removePromotions) })
+                    }
+                    HorizontalDivider()
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Column(Modifier.weight(1f)) {
+                            Text("促销移出通知栏", style = MaterialTheme.typography.titleSmall)
+                            Text("仅确认的纯促销；内容仍在已收起中", style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                        Switch(surfaceSettings.removePromotions, { onSurfaceChange(surfaceSettings.summary, it) })
+                    }
+                    if (surfaceSettings.removePromotions) Text("原通知先到达系统，移除无法消除已响过的提示音。恢复列表内容不会重新发出原通知。",
+                        style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+            }
+        }
+        if (priorityCount > 0) item {
+            SettingsDestination("会话优先", "已记住 $priorityCount 个会话 · 管理与撤销", Icons.Outlined.Apps, onManagePriority)
         }
         item {
             Column {
@@ -70,7 +103,7 @@ private fun SettingsDestination(title: String, subtitle: String, icon: ImageVect
         shape = RoundedCornerShape(24.dp),
         border = if (highlighted) BorderStroke(2.dp, MaterialTheme.colorScheme.primary) else null,
         modifier = Modifier.fillMaxWidth()) {
-        Row(Modifier.heightIn(min = 104.dp).padding(20.dp), verticalAlignment = Alignment.CenterVertically,
+        Row(Modifier.heightIn(min = 84.dp).padding(16.dp), verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(16.dp)) {
             Surface(shape = RoundedCornerShape(14.dp), color = MaterialTheme.colorScheme.primaryContainer) {
                 Icon(icon, contentDescription = null, modifier = Modifier.padding(12.dp).size(24.dp),

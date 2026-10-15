@@ -8,9 +8,11 @@ import kotlinx.coroutines.CancellationException
 
 class AnalysisWorker(context: Context, parameters: WorkerParameters) : CoroutineWorker(context, parameters) {
     override suspend fun doWork(): Result = try {
-        val processor = (applicationContext as QingxuApplication).container.processor
+        val container = (applicationContext as QingxuApplication).container
+        val processor = container.processor
         val retryOnly = inputData.getBoolean(AnalysisScheduler.RETRY_ONLY, false)
         val retriesRemain = processor.processBatch(runAttemptCount, includeRetry = retryOnly, onlyRetry = retryOnly)
+        container.surface.refresh()
         if (retryOnly && retriesRemain) Result.retry() else {
             if (retriesRemain) AnalysisScheduler.enqueueRetry(applicationContext)
             Result.success()

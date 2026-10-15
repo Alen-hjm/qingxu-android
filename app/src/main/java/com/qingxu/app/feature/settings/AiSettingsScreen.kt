@@ -40,7 +40,7 @@ fun AiSettingsScreen(settings: AiSettings, apps: List<SourceApp>, selected: Set<
     rules: List<SourceKindRule>, onSave: (String, String, String?, Boolean, Set<String>, String, AiProvider, AiEndpointMode, AiAuthMode) -> Unit,
     onTest: (AiConnectionDraft) -> Unit, onClearKey: () -> Unit, onReanalyze: () -> Unit, onRemoveRule: (SourceKindRule) -> Unit,
     onPrivacySettings: () -> Unit = {}, testStatus: AiConnectionTestStatus = AiConnectionTestStatus(),
-    onConnectionChanged: () -> Unit = {}) {
+    onConnectionChanged: () -> Unit = {}, localOnlyPackages: Set<String> = emptySet()) {
     val latestOnConnectionChanged by rememberUpdatedState(onConnectionChanged)
     DisposableEffect(Unit) {
         onDispose { latestOnConnectionChanged() }
@@ -227,18 +227,29 @@ fun AiSettingsScreen(settings: AiSettings, apps: List<SourceApp>, selected: Set<
                     style = MaterialTheme.typography.bodyMedium)
                 Text("「仅本机」设置优先，仍不会上传。", style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.primary)
+                if (selected.any { it in localOnlyPackages }) {
+                    TextButton(onClick = onPrivacySettings, contentPadding = PaddingValues(horizontal = 0.dp)) {
+                        Text("管理本机限制")
+                    }
+                }
                 if (selected.isEmpty()) Text("先到「设置 → 整理哪些应用」选择消息来源。", style = MaterialTheme.typography.bodyMedium)
             }
         }
         items(apps.filter { it.packageName in selected }, key = { it.packageName }) { app ->
+            val localOnly = app.packageName in localOnlyPackages
+            val cloudAllowed = !localOnly && app.packageName in allowed
             Row(Modifier.fillMaxWidth().heightIn(min = 56.dp).toggleable(
-                value = app.packageName in allowed, role = Role.Checkbox,
+                value = cloudAllowed, enabled = !localOnly, role = Role.Checkbox,
                 onValueChange = { checked -> allowed = if (checked) allowed + app.packageName else allowed - app.packageName })
                 .semantics { contentDescription = "允许云端分析${app.label}的通知" }, verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 AppAvatar(app.packageName, app.label)
-                Text(app.label, Modifier.weight(1f), style = MaterialTheme.typography.titleMedium)
-                Checkbox(app.packageName in allowed, onCheckedChange = null)
+                Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Text(app.label, style = MaterialTheme.typography.titleMedium)
+                    if (localOnly) Text("仅本机 · 隐私保护", style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+                Checkbox(cloudAllowed, onCheckedChange = null, enabled = !localOnly)
             }
         }
         item {
@@ -288,7 +299,7 @@ fun AiSettingsScreen(settings: AiSettings, apps: List<SourceApp>, selected: Set<
                     Text("本机目前使用规则，尚未接入端侧 AI。无法判断的通知保留可见。只整理轻序内的列表，系统原通知保留。",
                         style = MaterialTheme.typography.bodySmall)
                 }
-                Button(onClick = { onSave(endpoint, model, key.ifBlank { null }, enabled, allowed.intersect(selected), interests, provider, endpointMode, authMode) },
+                Button(onClick = { onSave(endpoint, model, key.ifBlank { null }, enabled, allowed.intersect(selected) - localOnlyPackages, interests, provider, endpointMode, authMode) },
                     modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)) {
                     Text(if (enabled) "保存并启用" else "保存设置")
                 }

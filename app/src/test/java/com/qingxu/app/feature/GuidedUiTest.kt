@@ -10,7 +10,6 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Surface
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.asAndroidBitmap
 import androidx.compose.ui.test.*
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.unit.dp
@@ -45,31 +44,25 @@ import org.robolectric.annotation.GraphicsMode
 class GuidedUiTest {
     @get:Rule val compose = createAndroidComposeRule<ComponentActivity>()
 
-    @Test fun exampleShowsAutomaticResultsThenTeachesCorrectionAndRestore() {
+    @Test fun exampleDemonstratesAutomaticGroupingWithoutManualClassification() {
         var practice by mutableStateOf(OnboardingState())
-        compose.setContent {
-            QingxuTheme {
-                Surface {
-                    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(20.dp)) {
-                        OnboardingExample(practice,
-                            onClassify = { if (it == UserLabel.FILTERED) practice = practice.copy(practice = 1, label = UserLabel.IMPORTANT_URGENT)
-                                else practice = practice.copy(label = it) },
-                            onStar = { practice = practice.copy(interested = !practice.interested) },
-                            onRestore = { practice = practice.copy(practice = 2) })
-                    }
-                }
+        var corrections = 0
+        compose.setContent { QingxuTheme { Surface {
+            Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(20.dp)) {
+                OnboardingExample(practice, onClassify = { corrections++ }, onStar = {}, onRestore = {},
+                    onDemo = { practice = practice.copy(practice = 2) })
             }
+        } } }
+        compose.onNodeWithText("虚构示例 · 不保存").assertExists()
+        compose.onNodeWithText("试试自动整理").performScrollTo().performClick()
+        compose.mainClock.advanceTimeBy(1_400)
+        compose.waitUntil(5_000) { practice.practice == 2 }
+        listOf("现在看", "稍后看", "已收起").forEach {
+            compose.onNodeWithText(it, substring = false).performScrollTo().assertIsDisplayed()
         }
-        capture("guide-classify")
-        compose.onNodeWithText("已收起 · 营销促销").assertExists()
-        compose.onNodeWithText("本机整理").assertExists()
-        compose.onNodeWithContentDescription("为什么这样整理？").performScrollTo().performClick()
-        compose.onNodeWithText("这条收起来", substring = false).performScrollTo().performClick()
-        compose.onNodeWithText("恢复到收件箱").performScrollTo().performClick()
-        compose.runOnIdle {
-            assertEquals(2, practice.practice)
-            assertEquals(UserLabel.IMPORTANT_URGENT, practice.label)
-        }
+        compose.onNodeWithText("示例不代表通知已接通；用「测试接收」验证。").performScrollTo().assertIsDisplayed()
+        compose.runOnIdle { assertEquals(2, practice.practice); assertEquals(0, corrections) }
+        capture("guide-automatic")
     }
 
     @Test fun inboxRendersBrandEmptyState() {
@@ -300,14 +293,14 @@ class GuidedUiTest {
             CompositionLocalProvider(LocalDensity provides Density(density.density, 1.8f)) {
                 QingxuTheme { Surface {
                     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(20.dp)) {
-                        OnboardingExample(OnboardingState(), {}, {}, {})
+                        OnboardingExample(OnboardingState(practice = 2), {}, {}, {})
                     }
                 } }
             }
         }
-        compose.onNodeWithText("这条收起来").performScrollTo().assertIsDisplayed()
-        compose.onNodeWithContentDescription("为什么这样整理？").performScrollTo().performClick()
-        compose.onNodeWithContentDescription("收起说明").assertExists()
+        compose.onNodeWithText("现在看", substring = false).performScrollTo().assertIsDisplayed()
+        compose.onNodeWithText("再试一次").performScrollTo().assertIsDisplayed()
+        capture("guide-large-text")
     }
 
     @Test fun automaticInboxShowsUncertainMessagesAndKeepsHiddenMessagesOut() {
@@ -324,10 +317,10 @@ class GuidedUiTest {
                     listenerConnected = true, loading = false), {}, { _, _ -> }, {}, {})
             } }
         }
-        capture("automatic-inbox")
-        compose.onNodeWithText("已自动整理 3 条 · 收起 1 条").assertExists()
+        capture("compact-inbox")
+        compose.onNodeWithText("自动整理 3 · 收起 1").assertExists()
         listOf("现在看 · 1", "稍后看 · 1", "其他消息 · 1").forEach { title ->
-            compose.onNode(hasScrollAction()).performScrollToNode(hasText(title))
+            compose.onNode(hasScrollToIndexAction()).performScrollToNode(hasText(title))
             compose.onNodeWithText(title).assertIsDisplayed()
         }
         compose.onNodeWithText("促销已收起").assertDoesNotExist()
@@ -339,13 +332,15 @@ class GuidedUiTest {
         capture("automatic-other-messages")
     }
 
-    @Test fun localPlacementRemainsClearWhileCloudIsPendingUnavailableOrPaused() {
+    @Test fun technicalStatesStayInDetailsAndReflectCloudAvailability() {
         var entry by mutableStateOf(exampleEntry("local-first", "LATER", "message").copy(analysisStatus = "pending"))
         compose.setContent { QingxuTheme { Surface {
             Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(20.dp)) {
                 NotificationCard(entry, {}, {}, {}, {})
             }
         } } }
+        compose.onNodeWithText("本机已整理", substring = false).assertDoesNotExist()
+        openCardDetails()
         compose.onNodeWithText("本机已整理", substring = false).assertExists()
         val statuses = listOf("retry" to "本机已整理 · 云端待重试", "retry2" to "本机已整理 · 云端待重试",
             "failed" to "本机已整理 · 云端暂不可用", "privacy_waiting" to "本机已整理 · 锁屏暂停云端")
@@ -372,24 +367,23 @@ class GuidedUiTest {
         compose.setContent {
             QingxuTheme { Surface {
                 Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(20.dp)) {
-                    NotificationCard(exampleEntry("rule", "LATER", "marketing"),
-                        onClassify = { correctionCount++ }, onInterest = {}, onRestore = {}, onOpen = {},
+                    NotificationCard(exampleEntry("rule", "HIDDEN", "marketing"),
+                        onClassify = { correctionCount++ }, onInterest = {}, onRestore = { correctionCount++ }, onOpen = {},
                         onHideSimilar = { ruleCount++ })
                 }
             } }
         }
         compose.onNodeWithText("这条收起来").assertDoesNotExist()
         compose.onNodeWithText("明确的通知内容，由本机规则整理。").assertDoesNotExist()
-        compose.onNodeWithContentDescription("为什么这样整理？").performScrollTo().performClick()
+        openCardDetails()
         compose.onNodeWithText("明确的通知内容，由本机规则整理。").assertExists()
-        compose.onNodeWithContentDescription("调整整理结果").performScrollTo().performClick()
-        compose.onNodeWithText("这条收起来").performClick()
+        compose.onNodeWithText("恢复到收件箱").performScrollTo().performClick()
         compose.runOnIdle { assertEquals(1, correctionCount); assertEquals(0, ruleCount) }
         compose.onNodeWithContentDescription("调整整理结果").performScrollTo().performClick()
-        compose.onNodeWithText("这类以后少显示").performClick()
-        compose.onNodeWithText("为「购物应用」添加一条规则", substring = true).assertExists()
+        compose.onNodeWithText("以后收起此应用的促销").performClick()
+        compose.onNodeWithText("仅收起「购物应用」中明确识别为促销的通知。", substring = true).assertExists()
         compose.runOnIdle { assertEquals(0, ruleCount) }
-        compose.onNodeWithText("添加规则", substring = false).performClick()
+        compose.onNodeWithText("记住偏好", substring = false).performClick()
         compose.runOnIdle { assertEquals(1, ruleCount) }
     }
 
@@ -402,10 +396,117 @@ class GuidedUiTest {
             } }
         }
         capture("automatic-hidden")
-        compose.onNodeWithText("本机整理").assertExists()
+        compose.onNodeWithText("本机整理").assertDoesNotExist()
         compose.onNodeWithText("这条收起来").assertDoesNotExist()
         compose.onNodeWithText("恢复到收件箱").performScrollTo().performClick()
         compose.runOnIdle { assertEquals("hidden-promotion", restored) }
+    }
+
+    @Test fun handlingRemovesMessageFromPendingAndCanBeUndone() {
+        val entry = exampleEntry("handle", "NOW", "transaction").copy(title = "需要确认退款")
+        var state by mutableStateOf(QingxuUiState(entries = listOf(entry), selectedPackages = setOf(entry.packageName),
+            permissionGranted = true, listenerConnected = true, loading = false))
+        var originalOpens = 0
+        compose.setContent { QingxuTheme { Surface {
+            InboxScreen(state, {}, { _, _ -> }, {}, onOpen = { originalOpens++ },
+                onHandled = { item, handled -> state = state.copy(entries = state.entries.map {
+                    if (it.notificationKey == item.notificationKey) it.copy(handledAt = if (handled) System.currentTimeMillis() else null) else it
+                }) })
+        } } }
+        compose.onNodeWithText("需要确认退款").performClick()
+        compose.runOnIdle { assertEquals(1, originalOpens) }
+        compose.onNodeWithText("已处理", substring = false).performClick()
+        compose.onNodeWithText("需要确认退款").assertDoesNotExist()
+        compose.onNodeWithText("暂时没有急事").assertExists()
+        compose.onNodeWithText("已处理 1").performClick()
+        compose.onNodeWithText("需要确认退款").assertExists()
+        capture("handled-inbox")
+        compose.onNodeWithText("恢复待看").performClick()
+        compose.runOnIdle { assertEquals(null, state.entries.single().handledAt) }
+        compose.onNodeWithText("待看 1").performClick()
+        compose.onNodeWithText("需要确认退款").assertExists()
+    }
+
+    @Test fun searchIsCollapsedAndFindsAppOrMessageWhenOpened() {
+        val entry = exampleEntry("search", "LATER", "delivery").copy(title = "包裹运输中")
+        compose.setContent { QingxuTheme { Surface {
+            InboxScreen(QingxuUiState(entries = listOf(entry), loading = false), {}, { _, _ -> }, {}, {})
+        } } }
+        compose.onNodeWithText("搜索消息或应用").assertDoesNotExist()
+        compose.onNodeWithContentDescription("搜索消息").performClick()
+        compose.onNodeWithText("搜索消息或应用").performTextInput("无匹配内容")
+        compose.onNodeWithText("包裹运输中").assertDoesNotExist()
+        compose.onNodeWithText("没有找到这条消息").assertExists()
+        compose.onNodeWithContentDescription("收起搜索").performClick()
+        compose.onNodeWithText("包裹运输中").assertExists()
+    }
+
+    @Test fun urgentAndUsefulMessagesNeverOfferPermanentAppCategoryHiding() {
+        var entry by mutableStateOf(exampleEntry("safe-actions", "LATER", "message"))
+        compose.setContent { QingxuTheme { Surface {
+            NotificationCard(entry, {}, {}, {}, {})
+        } } }
+        listOf("message" to "LATER", "transaction" to "NOW", "event" to "LATER", "marketing" to "NOW").forEach { (kind, bucket) ->
+            compose.runOnIdle { entry = entry.copy(machineKind = kind, machineBucket = bucket) }
+            compose.onNodeWithContentDescription("调整整理结果").performClick()
+            compose.onNodeWithText("以后收起此应用的促销").assertDoesNotExist()
+            compose.onNodeWithText("这条很重要").performClick()
+        }
+    }
+
+    @Test fun conversationPriorityRequiresUsableSenderAndRemembersOnlyAfterConfirmation() {
+        var entry by mutableStateOf(exampleEntry("sender", "LATER", "message").copy(
+            packageName = "com.tencent.mm", appLabel = "微信", title = "小林", body = "周末一起吃饭吗？"))
+        var preferences = 0
+        compose.setContent { QingxuTheme { Surface {
+            NotificationCard(entry, {}, {}, {}, {}, onPrioritizeSender = { preferences++ })
+        } } }
+        compose.onNodeWithContentDescription("调整整理结果").performClick()
+        compose.onNodeWithText("这个会话优先").performClick()
+        compose.onNodeWithText("轻序会在本机记住这个偏好", substring = true).assertExists()
+        compose.runOnIdle { assertEquals(0, preferences) }
+        compose.onNodeWithText("记住偏好").performClick()
+        compose.runOnIdle { assertEquals(1, preferences); entry = entry.copy(title = "微信", body = "你收到一条新消息") }
+        compose.onNodeWithContentDescription("调整整理结果").performClick()
+        compose.onNodeWithText("这个会话优先").assertDoesNotExist()
+    }
+
+    @Test fun receivingTestShowsSuccessOnlyWhenListenerReportsReceipt() {
+        var state by mutableStateOf(QingxuUiState(permissionGranted = true, listenerConnected = true,
+            selectedPackages = setOf("chat.example"), loading = false))
+        var tests = 0
+        compose.setContent { QingxuTheme { Surface {
+            InboxScreen(state, {}, { _, _ -> }, {}, {}, onTestNotification = { tests++ })
+        } } }
+        compose.onNodeWithText("已连接 · 等待新消息").assertExists()
+        compose.onNodeWithText("测试接收").performClick()
+        compose.runOnIdle { assertEquals(1, tests) }
+        compose.onNodeWithText("测试消息已收到").assertDoesNotExist()
+        compose.runOnIdle { state = state.copy(deliveryTestRunning = true) }
+        compose.onNodeWithText("等待测试消息…").assertExists()
+        compose.onNodeWithText("测试接收").assertIsNotEnabled()
+        compose.runOnIdle { state = state.copy(deliveryTestRunning = false, deliveryTestMessage = "请允许轻序发送测试通知") }
+        compose.onNodeWithText("请允许轻序发送测试通知").assertExists()
+        compose.onNodeWithText("测试消息已收到").assertDoesNotExist()
+        compose.runOnIdle { state = state.copy(deliveryTestReceivedAt = System.currentTimeMillis() + 1_000) }
+        compose.onNodeWithText("测试消息已收到").assertExists()
+        capture("receiving-test-confirmed")
+    }
+
+    @Test fun expiredOtpLeavesNowWhileUnresolvedTransactionStaysPrioritized() {
+        val otp = exampleEntry("expired-otp", "NOW", "verification").copy(title = "验证码 123456")
+        val transaction = exampleEntry("refund", "NOW", "transaction").copy(title = "退款失败")
+        compose.setContent { QingxuTheme { Surface {
+            InboxScreen(QingxuUiState(entries = listOf(otp, transaction), loading = false), {}, { _, _ -> }, {}, {})
+        } } }
+        compose.onNodeWithText("1 条现在看").assertExists()
+        compose.onNodeWithText("现在看 · 1").assertExists()
+        compose.onNodeWithText("稍后看 · 1").performScrollTo().assertIsDisplayed()
+    }
+
+    private fun openCardDetails() {
+        compose.onNodeWithContentDescription("调整整理结果").performScrollTo().performClick()
+        compose.onNodeWithText("整理详情", substring = false).performClick()
     }
 
     private fun exampleEntry(key: String, bucket: String, kind: String) = NotificationEntry(

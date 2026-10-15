@@ -6,6 +6,7 @@ import android.service.notification.StatusBarNotification
 import android.util.Log
 import com.qingxu.app.QingxuApplication
 import com.qingxu.app.data.local.CapturedNotification
+import com.qingxu.app.data.local.NotificationEntry
 import java.lang.ref.WeakReference
 import java.security.MessageDigest
 
@@ -31,7 +32,7 @@ class QingxuNotificationListener : NotificationListenerService() {
     }
 
     override fun onNotificationRemoved(sbn: StatusBarNotification) {
-        if (instance?.get() !== this) return
+        if (instance?.get() !== this || sbn.packageName == packageName) return
         handleNotificationSafely {
             NotificationActions.remove(sbn.key)
             container.repository.enqueueRemoval(sbn.key, System.currentTimeMillis())
@@ -68,7 +69,11 @@ class QingxuNotificationListener : NotificationListenerService() {
     }
 
     private fun capture(sbn: StatusBarNotification) {
-        if (sbn.packageName == packageName || !container.sources.accepts(sbn.packageName)) return
+        if (sbn.packageName == packageName) {
+            container.delivery.receiveTest(sbn.notification)
+            return
+        }
+        if (!container.sources.accepts(sbn.packageName)) return
         val notification = sbn.notification
         if (notification.flags and Notification.FLAG_GROUP_SUMMARY != 0 || sbn.isOngoing) return
         val extras = notification.extras
@@ -82,9 +87,7 @@ class QingxuNotificationListener : NotificationListenerService() {
                 sbn.packageName
             }
         }
-        val hash = MessageDigest.getInstance("SHA-256")
-            .digest("${title.length}:$title${body.length}:$body".toByteArray(Charsets.UTF_8))
-            .joinToString("") { "%02x".format(it) }
+        val hash = notificationContentHash(title, body)
         NotificationActions.remember(sbn.key, notification.contentIntent)
         container.repository.enqueueCapture(CapturedNotification(
             notificationKey = sbn.key,
@@ -108,8 +111,25 @@ class QingxuNotificationListener : NotificationListenerService() {
         private var instance: WeakReference<QingxuNotificationListener>? = null
         /** Called on the main thread after the user enables a source. */
         fun refreshActive() { instance?.get()?.captureActive() }
+        internal fun removeConfirmedPromotion(entry: NotificationEntry) {
+            val service = instance?.get() ?: return
+            if (!NotificationActions.connected.value || !service.container.surfacePreferences.state.value.removePromotions ||
+                !service.container.sources.accepts(entry.packageName) || !entry.canRemovePromotion()) return
+            handleNotificationSafely {
+                val current = service.activeNotifications?.firstOrNull { it.key == entry.notificationKey } ?: return@handleNotificationSafely
+                if (current.packageName != entry.packageName || current.isOngoing ||
+                    current.notification.flags and Notification.FLAG_GROUP_SUMMARY != 0) return@handleNotificationSafely
+                val title = current.notification.extras.getCharSequence(Notification.EXTRA_TITLE)?.toString().orEmpty().take(300)
+                val body = readNotificationBody(current.notification).take(4000)
+                if (notificationContentHash(title, body) == entry.contentHash) service.cancelNotification(current.key)
+            }
+        }
     }
 }
+
+internal fun notificationContentHash(title: String, body: String): String = MessageDigest.getInstance("SHA-256")
+    .digest("${title.length}:$title${body.length}:$body".toByteArray(Charsets.UTF_8))
+    .joinToString("") { "%02x".format(it) }
 
 /** A malformed notification must not interrupt later callbacks or active-notification sync. */
 internal fun handleNotificationSafely(handle: () -> Unit) {

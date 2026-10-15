@@ -6,6 +6,7 @@ import android.content.pm.PackageManager
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.qingxu.app.QingxuApplication
+import com.qingxu.app.AppContainer
 import com.qingxu.app.data.local.NotificationEntry
 import com.qingxu.app.data.local.UserLabel
 import com.qingxu.app.notification.NotificationAccess
@@ -38,6 +39,12 @@ import java.util.concurrent.atomic.AtomicLong
 import com.qingxu.app.core.privacy.deviceIsPrivate
 import com.qingxu.app.core.processing.AnalysisScheduler
 import com.qingxu.app.data.local.SourceKindRule
+import com.qingxu.app.data.local.SenderPriorityRule
+import com.qingxu.app.data.local.SenderPreferencePolicy
+import com.qingxu.app.core.decision.Decision
+import com.qingxu.app.core.decision.effectiveBucket
+import com.qingxu.app.core.decision.isLongTermHideEligible
+import com.qingxu.app.notification.SurfaceSettings
 import kotlinx.coroutines.flow.asStateFlow
 
 data class SourceApp(val packageName: String, val label: String)
@@ -51,10 +58,14 @@ data class QingxuUiState(
     val captureFailed: Boolean = false,
     val loading: Boolean = true,
     val listenerRecovering: Boolean = false,
+    val lastReceivedAt: Long? = null,
+    val deliveryTestRunning: Boolean = false,
+    val deliveryTestReceivedAt: Long? = null,
+    val deliveryTestMessage: String = "",
 )
 
-class QingxuViewModel(application: Application) : AndroidViewModel(application) {
-    private val container = (application as QingxuApplication).container
+class QingxuViewModel internal constructor(application: Application, private val container: AppContainer) : AndroidViewModel(application) {
+    constructor(application: Application) : this(application, (application as QingxuApplication).container)
     private val apps = MutableStateFlow<List<SourceApp>>(emptyList())
     private val access = MutableStateFlow(NotificationAccess.granted(application))
     private val messageChannel = Channel<String>(Channel.BUFFERED)
@@ -73,12 +84,14 @@ class QingxuViewModel(application: Application) : AndroidViewModel(application) 
     private val mutableAiStatus = MutableStateFlow("")
     val aiStatus = mutableAiStatus.asStateFlow()
     val rules = container.dao.observeRules().stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+    val prioritySenders = container.dao.observePrioritySenders().stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+    val surfaceSettings = container.surfacePreferences.state
     private val mutableConnectionTest = MutableStateFlow(AiConnectionTestStatus())
     val connectionTest = mutableConnectionTest.asStateFlow()
     private var connectionTestJob: Job? = null
     private val connectionTestGeneration = AtomicLong()
 
-    val state = combine(
+    private val inboxState = combine(
         container.repository.entries.catch {
             messageChannel.send("读取本地通知失败，请重新打开轻序")
             emit(emptyList())
@@ -90,7 +103,24 @@ class QingxuViewModel(application: Application) : AndroidViewModel(application) 
     ) { entries, selected, sourceApps, granted, status ->
         QingxuUiState(entries, selected, sourceApps, granted, status.first, status.second, loading = false,
             listenerRecovering = status.third)
+    }
+    val state = combine(inboxState, container.delivery.state) { inbox, delivery ->
+        inbox.copy(lastReceivedAt = delivery.lastReceivedAt, deliveryTestRunning = delivery.testRunning,
+            deliveryTestReceivedAt = delivery.testReceivedAt, deliveryTestMessage = delivery.testMessage)
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), QingxuUiState())
+
+    fun testNotification() = container.delivery.startTest()
+
+    fun saveSurface(summary: Boolean, removePromotions: Boolean) {
+        if (!requirePrivateAccess()) return
+        write {
+            container.processor.gate.withLock {
+                if (!requirePrivateAccess()) return@write
+                container.surfacePreferences.save(summary, removePromotions)
+            }
+            container.surface.refresh()
+        }
+    }
 
     private var refreshing = false
 
@@ -144,12 +174,14 @@ class QingxuViewModel(application: Application) : AndroidViewModel(application) 
         if (selected && !requirePrivateAccess()) return
         write {
             container.processor.gate.withLock {
+                if (selected && !requirePrivateAccess()) return@write
                 container.processor.invalidatePolicy()
                 container.sources.setSelected(packageName, selected)
                 container.dao.requeueForPackages(listOf(packageName))
             }
             if (selected) QingxuNotificationListener.refreshActive()
             AnalysisScheduler.enqueue(getApplication())
+            container.surface.refresh()
         }
     }
 
@@ -161,6 +193,7 @@ class QingxuViewModel(application: Application) : AndroidViewModel(application) 
             try {
                 container.ensureStorageReady()
                 container.processor.gate.withLock {
+                    if (!requirePrivateAccess()) return@launch
                     withContext(Dispatchers.IO) { container.ai.save(endpoint, model, key, enabled, allowed, interests, provider, endpointMode, authMode) }
                     container.processor.invalidatePolicy()
                     container.dao.requeueForPackages(container.sources.selected.value.toList())
@@ -248,6 +281,7 @@ class QingxuViewModel(application: Application) : AndroidViewModel(application) 
 
     fun reanalyze() = write {
         container.processor.gate.withLock {
+            if (!requirePrivateAccess()) return@write
             container.processor.invalidatePolicy()
             container.dao.requeueForPackages(container.sources.selected.value.toList())
         }
@@ -256,18 +290,21 @@ class QingxuViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun hideSimilar(entry: NotificationEntry) = write {
-        if (entry.machineKind !in listOf("marketing", "transaction", "delivery", "event", "message")) return@write
+        if (!requirePrivateAccess() || !Decision(entry.effectiveBucket(), entry.machineKind, entry.machineReason,
+            entry.machineConfidence, entry.analysisSource).isLongTermHideEligible()) return@write
         container.processor.gate.withLock {
+            if (!requirePrivateAccess()) return@write
             container.processor.invalidatePolicy()
             container.dao.saveRule(SourceKindRule(entry.packageName, entry.machineKind, true))
             container.dao.requeueForPackages(listOf(entry.packageName))
         }
         AnalysisScheduler.enqueue(getApplication())
-        messageChannel.send("已设为收起此应用的同类消息，可在高级设置中撤销")
+        messageChannel.send("已记住此应用的纯促销偏好，可在高级设置撤销")
     }
 
     fun removeRule(rule: SourceKindRule) = write {
         container.processor.gate.withLock {
+            if (!requirePrivateAccess()) return@write
             container.processor.invalidatePolicy()
             container.dao.deleteRule(rule.packageName, rule.kind)
             container.dao.requeueForPackages(listOf(rule.packageName))
@@ -280,19 +317,67 @@ class QingxuViewModel(application: Application) : AndroidViewModel(application) 
     fun classifyExample(label: UserLabel) = container.onboarding.classify(label)
     fun starExample() = container.onboarding.star()
     fun restoreExample() = container.onboarding.restore()
+    fun demoExample() = container.onboarding.demo()
+
+    fun setHandled(entry: NotificationEntry, handled: Boolean) = write {
+        if (!requirePrivateAccess()) return@write
+        container.processor.gate.withLock {
+            if (!requirePrivateAccess()) return@write
+            if (container.repository.setHandled(entry.notificationKey, handled, entry.contentVersion, entry.contentHash) == 0)
+                messageChannel.send("消息内容已更新，请查看后再操作")
+        }
+        container.surface.refresh()
+        if (!handled) AnalysisScheduler.enqueue(getApplication())
+    }
+
+    fun prioritizeSender(entry: NotificationEntry) = write {
+        if (!requirePrivateAccess()) return@write
+        val scope = SenderPreferencePolicy.senderScope(entry) ?: return@write
+        container.processor.gate.withLock {
+            if (!requirePrivateAccess()) return@write
+            container.processor.invalidatePolicy()
+            container.dao.savePrioritySender(SenderPriorityRule(entry.packageName, scope))
+            container.dao.requeueForPackages(listOf(entry.packageName))
+        }
+        AnalysisScheduler.enqueue(getApplication())
+        messageChannel.send("已记住这个会话优先，可在设置中撤销")
+    }
+
+    fun removePriority(rule: SenderPriorityRule) = write {
+        if (!requirePrivateAccess()) return@write
+        container.processor.gate.withLock {
+            if (!requirePrivateAccess()) return@write
+            container.processor.invalidatePolicy()
+            container.dao.deletePrioritySender(rule.packageName, rule.scopeHash)
+            container.dao.requeueForPackages(listOf(rule.packageName))
+        }
+        AnalysisScheduler.enqueue(getApplication())
+        messageChannel.send("已撤销会话优先")
+    }
 
     fun classify(entry: NotificationEntry, label: UserLabel) = write {
-        if (container.repository.classify(entry.notificationKey, label, entry.contentVersion, entry.contentHash) == 0) {
-            messageChannel.send("消息内容已更新，请查看后再操作")
+        if (!requirePrivateAccess()) return@write
+        container.processor.gate.withLock {
+            if (!requirePrivateAccess()) return@write
+            container.processor.invalidatePolicy()
+            if (container.repository.classify(entry.notificationKey, label, entry.contentVersion, entry.contentHash) == 0)
+                messageChannel.send("消息内容已更新，请查看后再操作")
         }
+        container.surface.refresh()
     }
     fun restore(entry: NotificationEntry) = write {
-        if (container.repository.restore(entry.notificationKey, entry.contentVersion, entry.contentHash) == 0) {
-            messageChannel.send("消息状态已更新，请查看当前内容")
+        if (!requirePrivateAccess()) return@write
+        container.processor.gate.withLock {
+            if (!requirePrivateAccess()) return@write
+            container.processor.invalidatePolicy()
+            if (container.repository.restore(entry.notificationKey, entry.contentVersion, entry.contentHash) == 0)
+                messageChannel.send("消息状态已更新，请查看当前内容")
         }
+        container.surface.refresh()
     }
     fun toggleInterest(entry: NotificationEntry) = write {
         container.processor.gate.withLock {
+            if (!requirePrivateAccess()) return@write
             container.processor.invalidatePolicy()
             container.repository.setInterested(entry.notificationKey, !entry.interested)
             container.dao.requeueOne(entry.notificationKey)
@@ -303,7 +388,15 @@ class QingxuViewModel(application: Application) : AndroidViewModel(application) 
     fun openOriginal(entry: NotificationEntry) {
         if (!requirePrivateAccess()) return
         if (!NotificationActions.open(entry.notificationKey)) {
-            messageChannel.trySend("原通知已失效或没有跳转入口，请到来源应用查看")
+            val context = getApplication<Application>()
+            val intent = context.packageManager.getLaunchIntentForPackage(entry.packageName)
+            try {
+                if (intent == null) messageChannel.trySend("原通知已失效，请到来源应用查看")
+                else {
+                    context.startActivity(intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                    messageChannel.trySend("原通知已失效，已打开来源应用")
+                }
+            } catch (_: Exception) { messageChannel.trySend("无法打开来源应用，请手动查看") }
         }
     }
 
@@ -333,6 +426,7 @@ class QingxuViewModel(application: Application) : AndroidViewModel(application) 
         if (!requirePrivateAccess()) return
         write {
             container.processor.gate.withLock {
+                if (!requirePrivateAccess()) return@write
                 withContext(Dispatchers.IO) { container.privacy.save(hideContent, blockCloudWhenLocked, localOnlyPackages, retentionDays) }
                 container.processor.invalidatePolicy()
                 container.dao.requeueForPackages(container.sources.selected.value.toList())
@@ -348,10 +442,12 @@ class QingxuViewModel(application: Application) : AndroidViewModel(application) 
         if (!requirePrivateAccess()) return
         write {
             container.processor.gate.withLock {
+                if (!requirePrivateAccess()) return@write
                 container.processor.invalidatePolicy()
                 withContext(Dispatchers.IO) { container.clearHistory() }
             }
             mutablePrivacyStatus.value = "本地通知历史已清除；来源应用原通知和你的偏好保持不变"
+            container.surface.refresh()
         }
     }
 }

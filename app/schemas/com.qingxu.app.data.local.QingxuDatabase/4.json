@@ -1,0 +1,259 @@
+{
+  "formatVersion": 1,
+  "database": {
+    "version": 4,
+    "identityHash": "762a8167d488dfc0930f300e3a5210f3",
+    "entities": [
+      {
+        "tableName": "notifications",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`notificationKey` TEXT NOT NULL, `packageName` TEXT NOT NULL, `appLabel` TEXT NOT NULL, `title` TEXT NOT NULL, `body` TEXT NOT NULL, `channelId` TEXT, `postedAt` INTEGER NOT NULL, `updatedAt` INTEGER NOT NULL, `contentHash` TEXT NOT NULL, `contentVersion` INTEGER NOT NULL, `userLabel` TEXT NOT NULL, `previousLabel` TEXT NOT NULL, `labelSource` TEXT NOT NULL, `interested` INTEGER NOT NULL, `removedAt` INTEGER, `handledAt` INTEGER, `machineBucket` TEXT NOT NULL DEFAULT 'REVIEW', `machineKind` TEXT NOT NULL DEFAULT 'unknown', `machineReason` TEXT NOT NULL DEFAULT '等待整理', `machineConfidence` REAL NOT NULL DEFAULT 0.0, `analysisStatus` TEXT NOT NULL DEFAULT 'pending', `analysisSource` TEXT NOT NULL DEFAULT '', `manualVersion` INTEGER NOT NULL DEFAULT 0, `storageEncryptionVersion` INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(`notificationKey`))",
+        "fields": [
+          {
+            "fieldPath": "notificationKey",
+            "columnName": "notificationKey",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "packageName",
+            "columnName": "packageName",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "appLabel",
+            "columnName": "appLabel",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "title",
+            "columnName": "title",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "body",
+            "columnName": "body",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "channelId",
+            "columnName": "channelId",
+            "affinity": "TEXT",
+            "notNull": false
+          },
+          {
+            "fieldPath": "postedAt",
+            "columnName": "postedAt",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "updatedAt",
+            "columnName": "updatedAt",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "contentHash",
+            "columnName": "contentHash",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "contentVersion",
+            "columnName": "contentVersion",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "userLabel",
+            "columnName": "userLabel",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "previousLabel",
+            "columnName": "previousLabel",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "labelSource",
+            "columnName": "labelSource",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "interested",
+            "columnName": "interested",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "removedAt",
+            "columnName": "removedAt",
+            "affinity": "INTEGER",
+            "notNull": false
+          },
+          {
+            "fieldPath": "handledAt",
+            "columnName": "handledAt",
+            "affinity": "INTEGER",
+            "notNull": false
+          },
+          {
+            "fieldPath": "machineBucket",
+            "columnName": "machineBucket",
+            "affinity": "TEXT",
+            "notNull": true,
+            "defaultValue": "'REVIEW'"
+          },
+          {
+            "fieldPath": "machineKind",
+            "columnName": "machineKind",
+            "affinity": "TEXT",
+            "notNull": true,
+            "defaultValue": "'unknown'"
+          },
+          {
+            "fieldPath": "machineReason",
+            "columnName": "machineReason",
+            "affinity": "TEXT",
+            "notNull": true,
+            "defaultValue": "'等待整理'"
+          },
+          {
+            "fieldPath": "machineConfidence",
+            "columnName": "machineConfidence",
+            "affinity": "REAL",
+            "notNull": true,
+            "defaultValue": "0.0"
+          },
+          {
+            "fieldPath": "analysisStatus",
+            "columnName": "analysisStatus",
+            "affinity": "TEXT",
+            "notNull": true,
+            "defaultValue": "'pending'"
+          },
+          {
+            "fieldPath": "analysisSource",
+            "columnName": "analysisSource",
+            "affinity": "TEXT",
+            "notNull": true,
+            "defaultValue": "''"
+          },
+          {
+            "fieldPath": "manualVersion",
+            "columnName": "manualVersion",
+            "affinity": "INTEGER",
+            "notNull": true,
+            "defaultValue": "0"
+          },
+          {
+            "fieldPath": "storageEncryptionVersion",
+            "columnName": "storageEncryptionVersion",
+            "affinity": "INTEGER",
+            "notNull": true,
+            "defaultValue": "0"
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "notificationKey"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_notifications_packageName",
+            "unique": false,
+            "columnNames": [
+              "packageName"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_notifications_packageName` ON `${TABLE_NAME}` (`packageName`)"
+          },
+          {
+            "name": "index_notifications_postedAt",
+            "unique": false,
+            "columnNames": [
+              "postedAt"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_notifications_postedAt` ON `${TABLE_NAME}` (`postedAt`)"
+          }
+        ],
+        "foreignKeys": []
+      },
+      {
+        "tableName": "source_kind_rules",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`packageName` TEXT NOT NULL, `kind` TEXT NOT NULL, `hidden` INTEGER NOT NULL, PRIMARY KEY(`packageName`, `kind`))",
+        "fields": [
+          {
+            "fieldPath": "packageName",
+            "columnName": "packageName",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "kind",
+            "columnName": "kind",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "hidden",
+            "columnName": "hidden",
+            "affinity": "INTEGER",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "packageName",
+            "kind"
+          ]
+        },
+        "indices": [],
+        "foreignKeys": []
+      },
+      {
+        "tableName": "sender_priority_rules",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`packageName` TEXT NOT NULL, `scopeHash` TEXT NOT NULL, PRIMARY KEY(`packageName`, `scopeHash`))",
+        "fields": [
+          {
+            "fieldPath": "packageName",
+            "columnName": "packageName",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "scopeHash",
+            "columnName": "scopeHash",
+            "affinity": "TEXT",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "packageName",
+            "scopeHash"
+          ]
+        },
+        "indices": [],
+        "foreignKeys": []
+      }
+    ],
+    "views": [],
+    "setupQueries": [
+      "CREATE TABLE IF NOT EXISTS room_master_table (id INTEGER PRIMARY KEY,identity_hash TEXT)",
+      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, '762a8167d488dfc0930f300e3a5210f3')"
+    ]
+  }
+}

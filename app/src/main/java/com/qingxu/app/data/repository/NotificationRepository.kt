@@ -26,6 +26,7 @@ class NotificationRepository(
     private val acceptCapture: (CapturedNotification) -> Boolean = { true },
     private val mutationGate: Mutex = Mutex(),
     private val initialDecision: ((NotificationEntry) -> Decision)? = null,
+    private val onPersisted: (CapturedNotification) -> Unit = {},
     private val onCaptured: () -> Unit = {},
 ) {
     // One application-owned queue preserves callback order, including across service restarts.
@@ -62,11 +63,14 @@ class NotificationRepository(
             if (!sources.accepts(notification.packageName)) return
             if (!acceptCapture(notification)) return
             dao.capture(notification, initialDecision)
+            onPersisted(notification)
             onCaptured()
         }
     }
     suspend fun classify(key: String, label: UserLabel, version: Int, hash: String) = dao.classify(key, label, version, hash)
     suspend fun restore(key: String, version: Int, hash: String) = dao.restore(key, version, hash)
+    suspend fun setHandled(key: String, handled: Boolean, expectedVersion: Int, expectedHash: String): Int =
+        dao.setHandled(key, handled, expectedVersion, expectedHash)
     suspend fun setInterested(key: String, value: Boolean) = dao.setInterested(key, value)
     suspend fun markRemoved(key: String, at: Long) = dao.markRemoved(key, at)
 

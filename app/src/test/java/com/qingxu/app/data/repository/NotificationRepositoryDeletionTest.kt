@@ -6,6 +6,7 @@ import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
 import com.qingxu.app.core.privacy.AesGcmNotificationCipher
 import com.qingxu.app.core.privacy.NotificationCipher
+import com.qingxu.app.core.privacy.NotificationEncryptionException
 import com.qingxu.app.data.local.CapturedNotification
 import com.qingxu.app.data.local.NotificationDao
 import com.qingxu.app.data.local.QingxuDatabase
@@ -54,13 +55,36 @@ class NotificationRepositoryDeletionTest {
 
     @After fun close() { database.close() }
 
+    @Test fun failedPersistenceDoesNotReportSuccessfulReception() = runBlocking {
+        dao.configureCipher(object : NotificationCipher {
+            override fun encrypt(plaintext: String, associatedData: String): String = throw NotificationEncryptionException()
+            override fun decrypt(ciphertext: String, associatedData: String): String = throw NotificationEncryptionException()
+        })
+        var persisted = 0
+        var captured = 0
+        val repository = NotificationRepository(dao, sources,
+            onPersisted = { persisted++ }, onCaptured = { captured++ })
+        try {
+            repository.capture(old)
+            throw AssertionError("Expected persistence to fail")
+        } catch (_: NotificationEncryptionException) { }
+        assertEquals(0, persisted)
+        assertEquals(0, captured)
+        database.openHelper.writableDatabase.query("SELECT COUNT(*) FROM notifications").use {
+            assertTrue(it.moveToFirst())
+            assertEquals(0, it.getInt(0))
+        }
+    }
+
     @Test fun waitingCaptureReadsDeletionCutoffOnlyAfterDeletionReleasesSharedGate() = runBlocking {
         withTimeout(10_000) {
             dao.capture(old)
             val ready = CompletableDeferred<Unit>()
             var captured = 0
+            var persisted: CapturedNotification? = null
             val repository = NotificationRepository(dao, sources, ensureReady = { ready.complete(Unit) },
-                acceptCapture = { it.postedAt > cutoff.get() }, mutationGate = gate, onCaptured = { captured++ })
+                acceptCapture = { it.postedAt > cutoff.get() }, mutationGate = gate,
+                onPersisted = { persisted = it }, onCaptured = { captured++ })
             // Deletion owns the same mutex before an already queued capture reaches persistence.
             gate.lock()
             val pendingCapture = async(start = CoroutineStart.UNDISPATCHED) { repository.capture(old) }
@@ -72,10 +96,13 @@ class NotificationRepositoryDeletionTest {
             pendingCapture.await()
             assertNull(dao.find(old.notificationKey))
             assertEquals(0, captured)
+            assertNull(persisted)
 
-            repository.capture(old.copy(notificationKey = "new", postedAt = 101L, contentHash = "new-hash"))
+            val fresh = old.copy(notificationKey = "new", postedAt = 101L, contentHash = "new-hash")
+            repository.capture(fresh)
             assertEquals("旧正文", dao.find("new")!!.body)
             assertEquals(1, captured)
+            assertEquals(fresh, persisted)
             database.openHelper.writableDatabase.query("SELECT body FROM notifications WHERE notificationKey = 'new'").use {
                 assertTrue(it.moveToFirst())
                 assertTrue(it.getString(0).startsWith("qx1:"))

@@ -55,7 +55,7 @@ object CloudDecisionPolicy {
         DecisionBucket.REVIEW -> "判断依据不足，已保留可见"
     }
     private val instructionLike = Regex("忽略.{0,20}(指令|规则|系统)|无视.{0,12}(指令|规则)|system\\s*:|assistant\\s*:|<\\|(?:system|assistant)|将.{0,16}(分类|标记|判断)为|输出.{0,12}(JSON|HIDDEN|marketing)|ignore.{0,30}(instructions|rules)|\\\"(?:kind|bucket|important|actionRequired)\\\"\\s*:", RegexOption.IGNORE_CASE)
-    private val sensitiveOrTransactional = Regex("退款|支付|扣款|交易|账单|付款|订单|发货|签收|快递|物流|包裹|配送|派送|取件|验证码|校验码|密码|口令|医疗|医院|诊断|复诊|过敏|急救|安全|异地登录|异常登录|燃气|火灾|盗刷")
+    private val sensitiveOrTransactional = Regex("退款|支付|扣款|交易|账单|付款|订单|发货|签收|快递|物流|包裹|配送|派送|取件|验证码|校验码|密码|口令|医疗|医院|诊断|复诊|过敏|急救|急诊|抢救|胸痛|昏迷|昏倒|晕倒|呼吸困难|喘不过气|流血|救命|求救|安全|异地登录|异常登录|燃气|火灾|着火|盗刷")
     private val promotion = Regex("优惠|折扣|促销|秒杀|大促|满\\d+减\\d+|立减|低至.{0,5}折|抢购|特惠")
     private val shoppingSource = Regex("taobao|tmall|jingdong|jd\\.|pinduoduo|suning|vipshop|meituan|eleme|amazon|ebay|淘宝|天猫|京东|拼多多|购物|商城|美团|饿了么", RegexOption.IGNORE_CASE)
     private val promotionalChannel = Regex("marketing|promotion|促销|营销|优惠", RegexOption.IGNORE_CASE)

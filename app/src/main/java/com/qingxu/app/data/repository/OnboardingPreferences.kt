@@ -11,9 +11,9 @@ data class OnboardingState(
     val label: UserLabel = UserLabel.UNSORTED,
     val interested: Boolean = false,
 ) {
-    fun step(hasSources: Boolean, permissionGranted: Boolean): Int = when {
+    fun step(hasSources: Boolean, permissionGranted: Boolean, listenerConnected: Boolean = true): Int = when {
         !hasSources -> 0
-        !permissionGranted -> 1
+        !permissionGranted || !listenerConnected -> 1
         else -> 2 + practice
     }
 }
@@ -33,6 +33,10 @@ class OnboardingPreferences(context: Context) {
 
     fun complete() = save(state.value.copy(completed = true))
     fun restart() = save(OnboardingState())
+
+    fun demo() {
+        if (!state.value.completed) save(state.value.copy(practice = 2))
+    }
 
     fun classify(label: UserLabel) {
         val current = state.value

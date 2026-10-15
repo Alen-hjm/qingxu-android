@@ -8,8 +8,10 @@ import com.qingxu.app.core.decision.Decision
 import com.qingxu.app.core.decision.DecisionBucket
 import com.qingxu.app.core.decision.LocalClassifier
 import com.qingxu.app.core.decision.CloudDecisionPolicy
+import com.qingxu.app.core.decision.isLongTermHideEligible
 import com.qingxu.app.data.local.NotificationDao
 import com.qingxu.app.data.local.NotificationEntry
+import com.qingxu.app.data.local.SenderPreferencePolicy
 import com.qingxu.app.data.repository.SourcePreferences
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.withContext
@@ -48,6 +50,7 @@ class NotificationProcessor(
         // Finish the whole local pass before starting any slow network request.
         for (entry in batch) {
             gate.withLock localPass@ {
+                if (!isCurrentPending(entry)) return@localPass
                 if (!sources.accepts(entry.packageName)) {
                     finish(entry, Decision(DecisionBucket.REVIEW, "unknown", "该应用已停止整理", 0.0), "paused")
                     return@localPass
@@ -59,15 +62,18 @@ class NotificationProcessor(
                 val permission = CloudPrivacyGate.permission(entry, snapshot, privacy, deviceLocked())
                 val sensitive = CloudPrivacyGate.containsSensitiveSecret(entry.title + " " + entry.body)
                 val decision = if (sensitive && local?.bucket == DecisionBucket.HIDDEN) fallback else local ?: fallback
+                val preferred = applyPreferences(entry, decision, snapshot)
+                val priorityConversation = preferred.source == "preference" && preferred.bucket == DecisionBucket.NOW
                 val status = when {
                     sensitive -> "local_only"
+                    priorityConversation -> "done"
                     local != null -> "done"
                     permission == CloudPermission.ALLOWED -> entry.analysisStatus
                     permission == CloudPermission.LOCKED -> "privacy_waiting"
                     else -> "local_only"
                 }
-                finish(entry, applyPreferences(entry, decision, snapshot), status)
-                if (!sensitive && local == null && permission == CloudPermission.ALLOWED) {
+                finish(entry, preferred, status)
+                if (!sensitive && !priorityConversation && local == null && permission == CloudPermission.ALLOWED) {
                     cloud += PendingCloud(entry, snapshot, privacy, policyGeneration, fallback)
                 }
             }
@@ -103,7 +109,7 @@ class NotificationProcessor(
             }
             gate.withLock applyDecision@ {
                 if (preferences.state.value.revision != snapshot.revision || privacySettings().revision != privacy.revision ||
-                    policyGeneration != generation || !sources.accepts(entry.packageName)) return@applyDecision
+                    policyGeneration != generation || !sources.accepts(entry.packageName) || !isCurrentPending(entry)) return@applyDecision
                 if (privacy.blockCloudWhenLocked && deviceLocked()) {
                     finish(entry, applyPreferences(entry, fallback, snapshot), "privacy_waiting")
                     return@applyDecision
@@ -134,14 +140,28 @@ class NotificationProcessor(
     private suspend fun applyPreferences(entry: NotificationEntry, input: Decision, settings: AiSettings): Decision {
         var decision = CloudDecisionPolicy.protect(entry, input)
         val latest = dao.find(entry.notificationKey) ?: return decision
-        val preference = dao.rules().firstOrNull { it.packageName == entry.packageName && it.kind == decision.kind && it.hidden }
-        if (preference != null && decision.bucket != DecisionBucket.REVIEW) {
-            decision = decision.copy(bucket = DecisionBucket.HIDDEN, reason = "按你的偏好收起此应用的这类消息", source = "preference")
-        } else if (decision.bucket == DecisionBucket.HIDDEN) {
+        if (latest.handledAt != null || latest.labelSource == "manual" ||
+            latest.contentVersion != entry.contentVersion || latest.contentHash != entry.contentHash) return decision
+        if (decision.bucket == DecisionBucket.NOW) return decision
+        // Only known chat sources with a readable, stable conversation title produce a local scope.
+        // The hash is a local preference lookup and is never included in a cloud request.
+        val scope = SenderPreferencePolicy.senderScope(latest)
+        if (scope != null && LocalClassifier.fallback(latest).bucket != DecisionBucket.REVIEW &&
+            dao.prioritySenders().any { it.packageName == latest.packageName && it.scopeHash == scope }) {
+            return Decision(DecisionBucket.NOW, "message", "按你的偏好优先显示这个会话的新消息", 1.0, "preference")
+        }
+        // Legacy rules for delivery/message/transaction/etc. cannot lower or hide useful messages.
+        // A marketing preference applies only after the original-notification safety gate agrees.
+        val preference = if (decision.isLongTermHideEligible()) dao.rules().firstOrNull {
+            it.packageName == entry.packageName && it.kind == "marketing" && it.hidden
+        } else null
+        if (decision.bucket == DecisionBucket.HIDDEN) {
             val terms = settings.interests.split(Regex("[,，;；\\n]")).map { it.trim() }.filter { it.length >= 2 }
             val content = entry.title + " " + entry.body
             if (latest.interested || terms.any { content.contains(it, ignoreCase = true) }) {
                 decision = decision.copy(bucket = DecisionBucket.LATER, reason = "命中你的关注内容，保留稍后查看", source = "preference")
+            } else if (preference != null) {
+                decision = decision.copy(reason = "按你的偏好收起此应用的纯促销消息", source = "preference")
             }
         }
         return decision
@@ -151,7 +171,7 @@ class NotificationProcessor(
         if (entry.postedAt <= privacySettings().deletedBefore) return false
         val current = dao.find(entry.notificationKey) ?: return false
         return current.contentVersion == entry.contentVersion && current.contentHash == entry.contentHash &&
-            current.labelSource != "manual" && current.analysisStatus in setOf("pending", "retry", "retry2")
+            current.handledAt == null && current.labelSource != "manual" && current.analysisStatus in setOf("pending", "retry", "retry2")
     }
 
     private class AuthorizationChanged : CancellationException("Cloud permission changed")

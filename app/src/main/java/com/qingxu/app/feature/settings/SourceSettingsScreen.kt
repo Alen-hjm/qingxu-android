@@ -19,18 +19,33 @@ import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
+import com.qingxu.app.core.ai.AiSettings
+import com.qingxu.app.core.ai.resolveAiEndpoint
+import com.qingxu.app.core.privacy.PrivacySettings
 import com.qingxu.app.core.ui.AppAvatar
 import com.qingxu.app.feature.QingxuUiState
 import com.qingxu.app.feature.onboarding.CoachHint
+import java.time.Instant
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
 
 @Composable
 fun SourceSettingsScreen(state: QingxuUiState, onPermissionSettings: () -> Unit,
     onSelectSource: (String, Boolean) -> Unit, guideStep: Int? = null,
-    requiresUnlock: Boolean = false, onUnlock: () -> Unit = {}, onReconnect: () -> Unit = {}) {
+    requiresUnlock: Boolean = false, onUnlock: () -> Unit = {}, onReconnect: () -> Unit = {},
+    privacySettings: PrivacySettings = PrivacySettings(), aiSettings: AiSettings = AiSettings(),
+    onTestNotification: () -> Unit = {}) {
     var query by rememberSaveable { mutableStateOf("") }
     var showHelp by rememberSaveable { mutableStateOf(false) }
     var showConnectionHelp by rememberSaveable { mutableStateOf(false) }
     val apps = state.sourceApps.filter { it.label.contains(query, true) || it.packageName.contains(query, true) }
+        .sortedBy { it.packageName !in state.selectedPackages }
+    val cloudConfigured = remember(aiSettings.endpoint, aiSettings.model, aiSettings.hasKey,
+        aiSettings.provider, aiSettings.endpointMode) {
+        aiSettings.hasKey && aiSettings.model.isNotBlank() && runCatching {
+            resolveAiEndpoint(aiSettings.endpoint, aiSettings.provider, aiSettings.endpointMode)
+        }.isSuccess
+    }
     val listState = rememberLazyListState()
     val keyboard = LocalSoftwareKeyboardController.current
     LaunchedEffect(guideStep) {
@@ -62,11 +77,31 @@ fun SourceSettingsScreen(state: QingxuUiState, onPermissionSettings: () -> Unit,
                     if (!state.permissionGranted) Text("授权后读取通知，只保存你选中的应用。", style = MaterialTheme.typography.bodySmall)
                     if (guideStep == 1) CoachHint("↑ 开启通知访问", "在系统设置中允许「轻序」，然后返回这里。")
                     if (state.permissionGranted) {
+                        state.lastReceivedAt?.let { receivedAt ->
+                            Text("最近接收 ${sourceReceivedTime(receivedAt)}", style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                        OutlinedButton(onClick = onTestNotification,
+                            enabled = state.listenerConnected && !state.deliveryTestRunning,
+                            modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)) {
+                            Text(if (state.deliveryTestRunning) "正在等待测试通知…" else "发送测试通知")
+                        }
+                        if (state.deliveryTestMessage.isNotBlank()) Text(state.deliveryTestMessage,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        else if (!state.deliveryTestRunning) state.deliveryTestReceivedAt?.let { receivedAt ->
+                            Text("上次测试接收 ${sourceReceivedTime(receivedAt)}", style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                    }
+                    if (state.permissionGranted) {
                         TextButton(onClick = { showConnectionHelp = !showConnectionHelp }, contentPadding = PaddingValues(0.dp)) {
                             Text("连接帮助")
                             Icon(if (showConnectionHelp) Icons.Outlined.ExpandLess else Icons.Outlined.ExpandMore, null)
                         }
                         if (showConnectionHelp) {
+                            Text("测试通知只验证接收连接，不上传消息，也不代表每个应用都能显示正文。",
+                                style = MaterialTheme.typography.bodySmall)
                             Text("重连后仍收不到消息，可在系统通知使用权中将轻序关闭再开启，然后返回这里。",
                                 style = MaterialTheme.typography.bodySmall)
                             Text("在手机的电池或后台管理中，允许轻序后台运行，避免被省电策略暂停。不同手机的设置名称可能不同。",
@@ -103,7 +138,18 @@ fun SourceSettingsScreen(state: QingxuUiState, onPermissionSettings: () -> Unit,
                 Row(Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                     AppAvatar(app.packageName, app.label)
-                    Text(app.label, Modifier.weight(1f), style = MaterialTheme.typography.titleMedium)
+                    Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Text(app.label, style = MaterialTheme.typography.titleMedium)
+                        if (selected) Text(when {
+                            app.packageName in privacySettings.localOnlyPackages -> "仅本机 · 隐私保护"
+                            !aiSettings.enabled -> "本机处理 · 云端未开启"
+                            !cloudConfigured -> "本机处理 · 云端未配置"
+                            app.packageName !in aiSettings.allowedPackages -> "本机处理 · 云端未授权"
+                            privacySettings.blockCloudWhenLocked -> "可云端复核 · 锁屏暂停"
+                            else -> "可云端复核"
+                        }, style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
                     Switch(selected, onCheckedChange = { onSelectSource(app.packageName, it) },
                         enabled = !requiresUnlock || selected,
                         modifier = Modifier.semantics { contentDescription = "整理${app.label}的通知" })
@@ -118,10 +164,13 @@ fun SourceSettingsScreen(state: QingxuUiState, onPermissionSettings: () -> Unit,
                 }
                 if (showHelp) {
                     Text("关闭某个来源后停止采集，已保存的通知仍保留。关闭系统通知访问可停止全部监听。")
-                    Text("轻序只整理内部列表，保留原系统通知，不追加提醒。只能读取系统提供的正文。")
+                    Text("默认保留原系统通知。可在设置开启数量摘要或移除确认的纯促销；只能读取系统提供的正文。")
                     Text("默认在本机处理。云端分析需另行开启，并逐个允许来源。")
                 }
             }
         }
     }
 }
+
+private fun sourceReceivedTime(timestamp: Long): String = DateTimeFormatter.ofPattern("MM月dd日 HH:mm")
+    .withZone(ZoneId.systemDefault()).format(Instant.ofEpochMilli(timestamp))

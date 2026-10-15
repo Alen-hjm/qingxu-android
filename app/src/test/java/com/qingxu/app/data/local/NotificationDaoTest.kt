@@ -9,6 +9,8 @@ import com.qingxu.app.core.decision.effectiveBucket
 import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -204,5 +206,69 @@ class NotificationDaoTest {
         assertEquals(listOf("local"), dao.pending().map { it.notificationKey })
         assertEquals(DecisionBucket.LATER, dao.find("classified")!!.effectiveBucket())
         assertEquals("manual", dao.find("manual")!!.analysisStatus)
+    }
+
+    @Test fun handlingUsesDisplayedContentAndLateAnalysisCannotReplaceHandledMessage() = runBlocking {
+        dao.capture(incoming)
+        assertEquals(1, dao.setHandled("key", true, 1, "hash-1"))
+        val handledAt = dao.find("key")!!.handledAt
+        assertNotNull(handledAt)
+        assertEquals(0, finish(bucket = "NOW"))
+        assertEquals(0, dao.pendingCount())
+        assertTrue(dao.pending().isEmpty())
+        dao.capture(incoming.copy(capturedAt = 10L))
+        assertEquals(handledAt, dao.find("key")!!.handledAt)
+
+        dao.capture(incoming.copy(body = "新消息", contentHash = "hash-2"))
+        assertNull(dao.find("key")!!.handledAt)
+        assertEquals(0, dao.setHandled("key", true, 1, "hash-1"))
+        assertEquals(0, dao.setHandled("key", true, 2, "hash-1"))
+        assertEquals(1, dao.pendingCount())
+        assertEquals(1, dao.setHandled("key", true, 2, "hash-2"))
+        assertEquals(0, dao.setHandled("key", false, 1, "hash-1"))
+        assertNotNull(dao.find("key")!!.handledAt)
+        assertEquals(1, dao.setHandled("key", false, 2, "hash-2"))
+        assertNull(dao.find("key")!!.handledAt)
+        assertEquals(1, dao.pendingCount())
+    }
+
+    @Test fun handledMessagesStayOutOfEveryAutomaticRequeueAndRetry() = runBlocking {
+        suspend fun add(key: String, status: String) {
+            dao.capture(incoming.copy(notificationKey = key))
+            dao.finishAnalysis(key, 1, "hash-1", "REVIEW", "unknown", "本机结果", .0, "local", status)
+            dao.setHandled(key, true, 1, "hash-1")
+        }
+        add("retry", "retry2")
+        add("paused", "privacy_waiting")
+        add("legacy", "local_only")
+        assertEquals(0, dao.pendingCount())
+        assertEquals(0, dao.retryCount())
+        assertTrue(dao.pending(onlyRetry = true).isEmpty())
+        assertEquals(0, dao.requeueCloudPaused())
+        assertEquals(0, dao.requeueLegacyLocalResults(listOf("example.app")))
+        dao.requeueForPackages(listOf("example.app"))
+        dao.requeueOne("legacy")
+        assertEquals("retry2", dao.find("retry")!!.analysisStatus)
+        assertEquals("privacy_waiting", dao.find("paused")!!.analysisStatus)
+        assertEquals("local_only", dao.find("legacy")!!.analysisStatus)
+        assertEquals(0, dao.pendingCount())
+    }
+
+    @Test fun conversationPriorityStoresOnlyScopedDigestsAndDoesNotSpreadAcrossApps() = runBlocking {
+        val chat = NotificationEntry("chat", "com.tencent.mm", "微信", "家人", "今天回家吃饭吗", null, 1, 1, "chat-hash")
+        val scope = SenderPreferencePolicy.senderScope(chat)!!
+        val qqScope = SenderPreferencePolicy.senderScope(chat.copy(packageName = "com.tencent.mobileqq", appLabel = "QQ"))!!
+        dao.savePrioritySender(SenderPriorityRule(chat.packageName, scope))
+        dao.savePrioritySender(SenderPriorityRule(chat.packageName, scope))
+        dao.savePrioritySender(SenderPriorityRule("com.tencent.mobileqq", qqScope))
+        assertEquals(2, dao.prioritySenders().size)
+        database.openHelper.writableDatabase.query("SELECT packageName, scopeHash FROM sender_priority_rules").use {
+            while (it.moveToNext()) {
+                assertEquals(64, it.getString(1).length)
+                assertTrue(!it.getString(1).contains("家人"))
+            }
+        }
+        dao.deletePrioritySender(chat.packageName, scope)
+        assertEquals(listOf(SenderPriorityRule("com.tencent.mobileqq", qqScope)), dao.prioritySenders())
     }
 }

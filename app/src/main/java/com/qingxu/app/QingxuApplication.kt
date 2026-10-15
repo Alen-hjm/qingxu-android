@@ -15,6 +15,10 @@ import com.qingxu.app.core.privacy.PrivacyPreferences
 import com.qingxu.app.core.privacy.ContentSession
 import com.qingxu.app.core.privacy.deviceIsPrivate
 import com.qingxu.app.data.local.MIGRATION_2_3
+import com.qingxu.app.data.local.MIGRATION_3_4
+import com.qingxu.app.notification.NotificationDelivery
+import com.qingxu.app.notification.NotificationSurface
+import com.qingxu.app.notification.NotificationSurfacePreferences
 import com.qingxu.app.data.local.initializeNotificationEncryption
 import com.qingxu.app.data.local.compactNotificationStorage
 import com.qingxu.app.core.decision.LocalClassifier
@@ -34,6 +38,7 @@ class QingxuApplication : Application(), Configuration.Provider {
         NotificationConnectionRecovery.install(this)
         AnalysisScheduler.installRepair(this)
         AnalysisScheduler.enqueue(this)
+        container.surface.refresh()
     }
 }
 
@@ -41,7 +46,7 @@ class AppContainer(application: Application) {
     private val storagePrefs = application.getSharedPreferences("notification_storage", android.content.Context.MODE_PRIVATE)
     private val database = Room.databaseBuilder(
         application, QingxuDatabase::class.java, "qingxu.db",
-    ).addMigrations(MIGRATION_1_2, MIGRATION_2_3).build()
+    ).addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4).build()
     val dao = database.notifications()
     private val storageGate = Mutex()
     private val storageMutationGate = Mutex()
@@ -95,6 +100,8 @@ class AppContainer(application: Application) {
     val ai = AiPreferences(application)
     val privacy = PrivacyPreferences(application)
     val contentSession = ContentSession()
+    val delivery = NotificationDelivery(application)
+    val surfacePreferences = NotificationSurfacePreferences(application)
     val processor = NotificationProcessor(dao, sources, ai,
         privacySettings = { privacy.state.value }, deviceLocked = { deviceIsPrivate(application) },
         beforeProcessing = { maintainStorage() }) { AnalysisScheduler.enqueue(application) }
@@ -110,7 +117,10 @@ class AppContainer(application: Application) {
             } else decision
         },
         acceptCapture = { it.postedAt > privacy.state.value.deletedBefore &&
-            (privacy.state.value.retentionDays == 0 || it.postedAt >= System.currentTimeMillis() - privacy.state.value.retentionDays * 86_400_000L) }) {
+            (privacy.state.value.retentionDays == 0 || it.postedAt >= System.currentTimeMillis() - privacy.state.value.retentionDays * 86_400_000L) },
+        onPersisted = { delivery.recordPersisted(it.postedAt); surface.refresh() }) {
         AnalysisScheduler.enqueue(application)
     }
+    val surface = NotificationSurface(application, dao, surfacePreferences, processor.gate,
+        selected = { sources.selected.value }, ensureReady = { maintainStorage() })
 }

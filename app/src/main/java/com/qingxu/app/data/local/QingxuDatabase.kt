@@ -8,10 +8,22 @@ import androidx.sqlite.db.SupportSQLiteDatabase
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
-@Database(entities = [NotificationEntry::class, SourceKindRule::class], version = 3, exportSchema = true)
+@Database(entities = [NotificationEntry::class, SourceKindRule::class, SenderPriorityRule::class], version = 4, exportSchema = true)
 @TypeConverters(LabelConverters::class)
 abstract class QingxuDatabase : RoomDatabase() {
     abstract fun notifications(): NotificationDao
+}
+
+val MIGRATION_3_4 = object : Migration(3, 4) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL("ALTER TABLE notifications ADD COLUMN handledAt INTEGER")
+        db.execSQL("CREATE TABLE IF NOT EXISTS sender_priority_rules (packageName TEXT NOT NULL, scopeHash TEXT NOT NULL, PRIMARY KEY(packageName, scopeHash))")
+        // Keep encrypted text untouched while undoing the old overly broad hide preference.
+        db.execSQL("""UPDATE notifications SET machineBucket = 'REVIEW', analysisStatus = 'pending',
+            analysisSource = '', machineConfidence = 0.0
+            WHERE analysisSource = 'preference' AND machineBucket = 'HIDDEN'
+            AND machineKind != 'marketing' AND labelSource != 'manual' AND handledAt IS NULL""")
+    }
 }
 
 val MIGRATION_2_3 = object : Migration(2, 3) {

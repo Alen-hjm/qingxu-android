@@ -81,10 +81,21 @@ abstract class NotificationDao {
     @Query("UPDATE notifications SET removedAt = :at WHERE notificationKey = :key")
     abstract suspend fun markRemoved(key: String, at: Long)
 
+    @Query("""UPDATE notifications SET
+        handledAt = CASE WHEN :handled THEN COALESCE(handledAt, :at) ELSE NULL END
+        WHERE notificationKey = :key AND contentVersion = :expectedVersion AND contentHash = :expectedHash""")
+    protected abstract suspend fun setHandledStored(
+        key: String, handled: Boolean, at: Long, expectedVersion: Int, expectedHash: String,
+    ): Int
+
+    /** Complete only the content actually shown. A recycled notification key is a new message. */
+    suspend fun setHandled(key: String, handled: Boolean, expectedVersion: Int, expectedHash: String): Int =
+        setHandledStored(key, handled, System.currentTimeMillis(), expectedVersion, expectedHash)
+
     @Query("""SELECT * FROM notifications
         WHERE ((NOT :onlyRetry AND analysisStatus = 'pending')
             OR (:includeRetry AND analysisStatus IN ('retry', 'retry2')))
-        AND labelSource != 'manual'
+        AND labelSource != 'manual' AND handledAt IS NULL
         ORDER BY CASE WHEN analysisStatus = 'pending' THEN 0 ELSE 1 END, updatedAt ASC LIMIT :limit""")
     protected abstract suspend fun pendingStored(limit: Int, includeRetry: Boolean, onlyRetry: Boolean): List<NotificationEntry>
 
@@ -92,20 +103,20 @@ abstract class NotificationDao {
         pendingStored(limit, includeRetry, onlyRetry).map(::decrypt)
 
     @Query("""SELECT COUNT(*) FROM notifications WHERE analysisStatus IN ('pending', 'retry', 'retry2')
-        AND labelSource != 'manual'""")
+        AND labelSource != 'manual' AND handledAt IS NULL""")
     abstract suspend fun pendingCount(): Int
 
     @Query("""SELECT COUNT(*) FROM notifications WHERE analysisStatus IN ('retry', 'retry2')
-        AND labelSource != 'manual'""")
+        AND labelSource != 'manual' AND handledAt IS NULL""")
     abstract suspend fun retryCount(): Int
 
     @Query("""UPDATE notifications SET analysisStatus = 'pending'
-        WHERE analysisStatus = 'privacy_waiting' AND labelSource != 'manual'""")
+        WHERE analysisStatus = 'privacy_waiting' AND labelSource != 'manual' AND handledAt IS NULL""")
     abstract suspend fun requeueCloudPaused(): Int
 
     /** Upgrade only unresolved legacy local results; do not replace completed cloud decisions. */
     @Query("""UPDATE notifications SET analysisStatus = 'pending'
-        WHERE packageName IN (:packages) AND labelSource != 'manual' AND machineBucket = 'REVIEW'
+        WHERE packageName IN (:packages) AND labelSource != 'manual' AND handledAt IS NULL AND machineBucket = 'REVIEW'
         AND analysisStatus NOT IN ('pending', 'retry', 'retry2')
         AND (analysisSource IN ('', 'local', 'cloud') OR analysisStatus = 'privacy_waiting')""")
     abstract suspend fun requeueLegacyLocalResults(packages: List<String>): Int
@@ -115,7 +126,7 @@ abstract class NotificationDao {
         machineReason = :reason, machineConfidence = :confidence, analysisSource = :source,
         analysisStatus = :status
         WHERE notificationKey = :key AND contentVersion = :version AND contentHash = :hash
-        AND labelSource != 'manual' AND analysisStatus IN ('pending', 'retry', 'retry2')
+        AND labelSource != 'manual' AND handledAt IS NULL AND analysisStatus IN ('pending', 'retry', 'retry2')
         AND storageEncryptionVersion = 1""")
     protected abstract suspend fun finishStoredAnalysis(
         key: String, version: Int, hash: String, bucket: String, kind: String,
@@ -129,7 +140,7 @@ abstract class NotificationDao {
         cipher.encrypt(reason, aad(key, "machineReason")), confidence, source, status)
 
     @Query("""SELECT * FROM notifications
-        WHERE packageName IN (:packages) AND labelSource != 'manual'""")
+        WHERE packageName IN (:packages) AND labelSource != 'manual' AND handledAt IS NULL""")
     protected abstract suspend fun storedForPackages(packages: List<String>): List<NotificationEntry>
 
     @Transaction
@@ -144,7 +155,7 @@ abstract class NotificationDao {
     @Transaction
     open suspend fun requeueOne(key: String) {
         val current = find(key) ?: return
-        if (current.labelSource != "manual") save(current.copy(machineBucket = "REVIEW",
+        if (current.labelSource != "manual" && current.handledAt == null) save(current.copy(machineBucket = "REVIEW",
             machineReason = "关注偏好已更新，等待整理", analysisStatus = "pending"))
     }
 
@@ -184,6 +195,23 @@ abstract class NotificationDao {
 
     @Query("DELETE FROM source_kind_rules WHERE packageName = :packageName AND kind = :kind")
     abstract suspend fun deleteRule(packageName: String, kind: String)
+
+    @Query("SELECT * FROM sender_priority_rules ORDER BY packageName, scopeHash")
+    abstract fun observePrioritySenders(): Flow<List<SenderPriorityRule>>
+
+    @Query("SELECT * FROM sender_priority_rules ORDER BY packageName, scopeHash")
+    abstract suspend fun prioritySenders(): List<SenderPriorityRule>
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    protected abstract suspend fun savePrioritySenderStored(rule: SenderPriorityRule)
+
+    suspend fun savePrioritySender(rule: SenderPriorityRule) {
+        require(rule.packageName.isNotBlank() && rule.scopeHash.matches(Regex("[0-9a-f]{64}")))
+        savePrioritySenderStored(rule)
+    }
+
+    @Query("DELETE FROM sender_priority_rules WHERE packageName = :packageName AND scopeHash = :scopeHash")
+    abstract suspend fun deletePrioritySender(packageName: String, scopeHash: String)
 
     private fun aad(key: String, field: String) = "qingxu.notification.v1:$key:$field"
 

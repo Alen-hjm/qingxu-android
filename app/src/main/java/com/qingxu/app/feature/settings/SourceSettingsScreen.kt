@@ -26,9 +26,10 @@ import com.qingxu.app.feature.onboarding.CoachHint
 @Composable
 fun SourceSettingsScreen(state: QingxuUiState, onPermissionSettings: () -> Unit,
     onSelectSource: (String, Boolean) -> Unit, guideStep: Int? = null,
-    requiresUnlock: Boolean = false, onUnlock: () -> Unit = {}) {
+    requiresUnlock: Boolean = false, onUnlock: () -> Unit = {}, onReconnect: () -> Unit = {}) {
     var query by rememberSaveable { mutableStateOf("") }
     var showHelp by rememberSaveable { mutableStateOf(false) }
+    var showConnectionHelp by rememberSaveable { mutableStateOf(false) }
     val apps = state.sourceApps.filter { it.label.contains(query, true) || it.packageName.contains(query, true) }
     val listState = rememberLazyListState()
     val keyboard = LocalSoftwareKeyboardController.current
@@ -45,11 +46,14 @@ fun SourceSettingsScreen(state: QingxuUiState, onPermissionSettings: () -> Unit,
                             Text("通知访问", style = MaterialTheme.typography.titleMedium)
                             Text(when {
                                 !state.permissionGranted -> "尚未开启"
-                                !state.listenerConnected -> "等待系统连接"
+                                !state.listenerConnected && state.listenerRecovering -> "正在恢复通知连接…"
+                                !state.listenerConnected -> "通知连接已断开"
                                 else -> "已连接"
                             }, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                         }
-                        TextButton(onClick = onPermissionSettings, modifier = if (guideStep == 1)
+                        TextButton(onClick = if (state.permissionGranted && !state.listenerConnected) onReconnect else onPermissionSettings,
+                            enabled = !state.permissionGranted || state.listenerConnected || !state.listenerRecovering,
+                            modifier = if (guideStep == 1)
                             Modifier.border(2.dp, MaterialTheme.colorScheme.primary, RoundedCornerShape(28.dp)).padding(3.dp)
                             else Modifier) {
                             Text(if (!state.permissionGranted) "去开启" else if (!state.listenerConnected) "重新连接" else "管理")
@@ -57,6 +61,19 @@ fun SourceSettingsScreen(state: QingxuUiState, onPermissionSettings: () -> Unit,
                     }
                     if (!state.permissionGranted) Text("授权后读取通知，只保存你选中的应用。", style = MaterialTheme.typography.bodySmall)
                     if (guideStep == 1) CoachHint("↑ 开启通知访问", "在系统设置中允许「轻序」，然后返回这里。")
+                    if (state.permissionGranted) {
+                        TextButton(onClick = { showConnectionHelp = !showConnectionHelp }, contentPadding = PaddingValues(0.dp)) {
+                            Text("连接帮助")
+                            Icon(if (showConnectionHelp) Icons.Outlined.ExpandLess else Icons.Outlined.ExpandMore, null)
+                        }
+                        if (showConnectionHelp) {
+                            Text("重连后仍收不到消息，可在系统通知使用权中将轻序关闭再开启，然后返回这里。",
+                                style = MaterialTheme.typography.bodySmall)
+                            Text("在手机的电池或后台管理中，允许轻序后台运行，避免被省电策略暂停。不同手机的设置名称可能不同。",
+                                style = MaterialTheme.typography.bodySmall)
+                            TextButton(onClick = onPermissionSettings) { Text("打开系统通知设置") }
+                        }
+                    }
                 }
             }
         }

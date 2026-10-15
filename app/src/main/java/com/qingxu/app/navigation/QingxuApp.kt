@@ -90,7 +90,8 @@ fun QingxuApp(viewModel: QingxuViewModel, onUnlock: () -> Unit = {}, onPermissio
                 0 -> InboxScreen(state, onSettings = { page = 5; viewModel.refresh() },
                     onClassify = viewModel::classify, onInterest = viewModel::toggleInterest,
                     onOpen = viewModel::openOriginal, tutorial = if (targetPage == 0) tutorial else null,
-                    onHideSimilar = viewModel::hideSimilar, concealContent = concealed, onUnlock = onUnlock)
+                    onHideSimilar = viewModel::hideSimilar, concealContent = concealed, onUnlock = onUnlock,
+                    onReconnect = viewModel::reconnectNotifications)
                 1 -> FilteredScreen(state.entries, viewModel::restore, viewModel::toggleInterest,
                     tutorial = if (targetPage == 1) tutorial else null, onHideSimilar = viewModel::hideSimilar,
                     concealContent = concealed, onUnlock = onUnlock)
@@ -105,7 +106,8 @@ fun QingxuApp(viewModel: QingxuViewModel, onUnlock: () -> Unit = {}, onPermissio
                     state.selectedPackages, privacyStatus, viewModel::savePrivacy, viewModel::deleteHistory, cloudEnabled = ai.enabled)
                 5 -> SourceSettingsScreen(state, onPermissionSettings, { packageName, selected ->
                     if (selected && concealed) onUnlock() else viewModel.selectSource(packageName, selected)
-                }, guideStep = if (guiding) guideStep else null, requiresUnlock = concealed, onUnlock = onUnlock)
+                }, guideStep = if (guiding) guideStep else null, requiresUnlock = concealed, onUnlock = onUnlock,
+                    onReconnect = viewModel::reconnectNotifications)
             }
         }
     }

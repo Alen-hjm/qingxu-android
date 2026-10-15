@@ -6,7 +6,8 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.outlined.AutoAwesome
+import androidx.compose.material.icons.outlined.ExpandLess
+import androidx.compose.material.icons.outlined.ExpandMore
 import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -20,6 +21,7 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.unit.dp
 import com.qingxu.app.core.decision.DecisionBucket
 import com.qingxu.app.core.decision.effectiveBucket
+import com.qingxu.app.core.decision.hasCurrentCorrection
 import com.qingxu.app.core.ui.BrandFace
 import com.qingxu.app.core.ui.NotificationCard
 import com.qingxu.app.core.ui.QuietState
@@ -38,13 +40,18 @@ fun InboxScreen(
     onHideSimilar: (NotificationEntry) -> Unit = {},
     concealContent: Boolean = false,
     onUnlock: () -> Unit = {},
+    onReconnect: () -> Unit = {},
 ) {
     var onlyInterested by rememberSaveable { mutableStateOf(false) }
+    var showOtherHelp by rememberSaveable { mutableStateOf(false) }
     val inbox = state.entries.filter { it.effectiveBucket() != DecisionBucket.HIDDEN }
     val visible = if (onlyInterested) inbox.filter { it.interested } else inbox
     val groups = visible.groupBy { it.effectiveBucket() }
     val nowCount = inbox.count { it.effectiveBucket() == DecisionBucket.NOW }
-    val hiddenCount = state.entries.size - inbox.size
+    val automaticallySorted = state.entries.filter {
+        !it.hasCurrentCorrection() && it.analysisSource in setOf("local", "rule", "preference", "ai", "jev") &&
+            it.effectiveBucket() != DecisionBucket.REVIEW
+    }
     val order = listOf(DecisionBucket.NOW, DecisionBucket.LATER, DecisionBucket.REVIEW)
     LazyColumn(
         modifier = Modifier.fillMaxSize(),
@@ -53,7 +60,8 @@ fun InboxScreen(
     ) {
         if (inbox.isNotEmpty()) item(key = "focus-header") {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                AutomaticFocusHeader(nowCount, hiddenCount)
+                AutomaticFocusHeader(nowCount, automaticallySorted.size,
+                    automaticallySorted.count { it.effectiveBucket() == DecisionBucket.HIDDEN })
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     FilterChip(selected = !onlyInterested, onClick = { onlyInterested = false },
                         label = { Text("全部 ${inbox.size}") })
@@ -70,9 +78,13 @@ fun InboxScreen(
             }
         }
         if (state.permissionGranted && !state.listenerConnected && state.selectedPackages.isNotEmpty()) item {
-            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                Text("等待系统连接", Modifier.weight(1f), color = MaterialTheme.colorScheme.onSurfaceVariant)
-                TextButton(onClick = onSettings) { Text("重新连接") }
+            Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Text(if (state.listenerRecovering) "正在恢复通知连接…" else "通知连接已断开",
+                        Modifier.weight(1f), color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    TextButton(onClick = onReconnect, enabled = !state.listenerRecovering) { Text("重新连接") }
+                }
+                TextButton(onClick = onSettings, contentPadding = PaddingValues(0.dp)) { Text("连接帮助") }
             }
         }
         if (state.captureFailed) item {
@@ -92,8 +104,19 @@ fun InboxScreen(
             val entries = groups[bucket].orEmpty().sortedByDescending { it.postedAt }
             if (entries.isNotEmpty()) {
                 item(key = "group:${bucket.name}") {
-                    Text("${bucketTitle(bucket)} · ${entries.size}", Modifier.padding(top = 8.dp),
-                        style = MaterialTheme.typography.titleMedium)
+                    Column {
+                        Row(Modifier.fillMaxWidth().padding(top = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Text("${bucketTitle(bucket)} · ${entries.size}", Modifier.weight(1f),
+                                style = MaterialTheme.typography.titleMedium)
+                            if (bucket == DecisionBucket.REVIEW) IconButton(onClick = { showOtherHelp = !showOtherHelp }) {
+                                Icon(if (showOtherHelp) Icons.Outlined.ExpandLess else Icons.Outlined.ExpandMore,
+                                    contentDescription = if (showOtherHelp) "收起其他消息说明" else "其他消息说明")
+                            }
+                        }
+                        if (bucket == DecisionBucket.REVIEW && showOtherHelp) Text(
+                            "暂时拿不准的消息保留在这里，不必逐条分类。觉得结果不合适时，再从消息菜单调整。",
+                            style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
                 }
                 items(entries, key = { it.notificationKey }) { entry ->
                     Box(Modifier.animateItem()) {
@@ -108,15 +131,16 @@ fun InboxScreen(
 }
 
 @Composable
-private fun AutomaticFocusHeader(nowCount: Int, hiddenCount: Int) {
+private fun AutomaticFocusHeader(nowCount: Int, automaticCount: Int, automaticHiddenCount: Int) {
     Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(28.dp))
         .background(Brush.linearGradient(listOf(MaterialTheme.colorScheme.primaryContainer,
             MaterialTheme.colorScheme.surface)))
         .padding(20.dp), verticalAlignment = Alignment.CenterVertically) {
         Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(6.dp)) {
             Text(if (nowCount > 0) "$nowCount 条值得先看" else "重要的，先看到", style = MaterialTheme.typography.headlineSmall)
-            if (hiddenCount > 0) Text("已收起 $hiddenCount 条", style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant)
+            if (automaticCount > 0) Text("已自动整理 $automaticCount 条" +
+                if (automaticHiddenCount > 0) " · 收起 $automaticHiddenCount 条" else "",
+                style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
         Spacer(Modifier.width(12.dp))
         BrandFace(Modifier.size(56.dp))
@@ -126,6 +150,6 @@ private fun AutomaticFocusHeader(nowCount: Int, hiddenCount: Int) {
 private fun bucketTitle(bucket: DecisionBucket): String = when (bucket) {
     DecisionBucket.NOW -> "现在看"
     DecisionBucket.LATER -> "稍后看"
-    DecisionBucket.REVIEW -> "待确认"
+    DecisionBucket.REVIEW -> "其他消息"
     DecisionBucket.HIDDEN -> "已收起"
 }

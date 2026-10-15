@@ -3,7 +3,6 @@ package com.qingxu.app.feature
 import android.app.Application
 import android.content.Intent
 import android.content.pm.PackageManager
-import android.service.notification.NotificationListenerService
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.qingxu.app.QingxuApplication
@@ -12,6 +11,7 @@ import com.qingxu.app.data.local.UserLabel
 import com.qingxu.app.notification.NotificationAccess
 import com.qingxu.app.notification.NotificationActions
 import com.qingxu.app.notification.QingxuNotificationListener
+import com.qingxu.app.notification.NotificationConnectionRecovery
 import java.text.Collator
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -50,6 +50,7 @@ data class QingxuUiState(
     val listenerConnected: Boolean = false,
     val captureFailed: Boolean = false,
     val loading: Boolean = true,
+    val listenerRecovering: Boolean = false,
 )
 
 class QingxuViewModel(application: Application) : AndroidViewModel(application) {
@@ -58,8 +59,9 @@ class QingxuViewModel(application: Application) : AndroidViewModel(application) 
     private val access = MutableStateFlow(NotificationAccess.granted(application))
     private val messageChannel = Channel<String>(Channel.BUFFERED)
     val messages = messageChannel.receiveAsFlow()
-    private val listenerStatus = combine(NotificationActions.connected, container.repository.captureFailed) {
-        connected, failed -> connected to failed
+    private val listenerStatus = combine(NotificationActions.connected, container.repository.captureFailed,
+        NotificationConnectionRecovery.recovering) { connected, failed, recovering ->
+        Triple(connected, failed, recovering)
     }
 
     val onboarding = container.onboarding.state
@@ -86,7 +88,8 @@ class QingxuViewModel(application: Application) : AndroidViewModel(application) 
         access,
         listenerStatus,
     ) { entries, selected, sourceApps, granted, status ->
-        QingxuUiState(entries, selected, sourceApps, granted, status.first, status.second, loading = false)
+        QingxuUiState(entries, selected, sourceApps, granted, status.first, status.second, loading = false,
+            listenerRecovering = status.third)
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), QingxuUiState())
 
     private var refreshing = false
@@ -94,13 +97,8 @@ class QingxuViewModel(application: Application) : AndroidViewModel(application) 
     fun refresh() {
         AnalysisScheduler.enqueue(getApplication())
         access.value = NotificationAccess.granted(getApplication())
-        if (access.value && !NotificationActions.connected.value) {
-            try {
-                NotificationListenerService.requestRebind(NotificationAccess.component(getApplication()))
-            } catch (_: SecurityException) {
-                messageChannel.trySend("请在系统设置中重新开启通知访问")
-            }
-        }
+        if (access.value) QingxuNotificationListener.refreshActive()
+        NotificationConnectionRecovery.request(getApplication())
         if (refreshing) return
         refreshing = true
         viewModelScope.launch {
@@ -114,6 +112,11 @@ class QingxuViewModel(application: Application) : AndroidViewModel(application) 
                 refreshing = false
             }
         }
+    }
+
+    fun reconnectNotifications() {
+        access.value = NotificationAccess.granted(getApplication())
+        NotificationConnectionRecovery.request(getApplication(), force = true)
     }
 
     private fun loadApps(): List<SourceApp> {

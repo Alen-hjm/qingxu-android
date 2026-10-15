@@ -82,6 +82,58 @@ class GuidedUiTest {
         capture("inbox-light")
     }
 
+    @Test fun inboxReconnectRunsRecoveryWithoutNavigatingAndReflectsTheActualConnection() {
+        var state by mutableStateOf(QingxuUiState(loading = false, permissionGranted = true,
+            selectedPackages = setOf("chat.example")))
+        var reconnects = 0
+        var settingsRequests = 0
+        compose.setContent { QingxuTheme { Surface {
+            InboxScreen(state, onSettings = { settingsRequests++ }, onClassify = { _, _ -> },
+                onInterest = {}, onOpen = {}, onReconnect = {
+                    reconnects++
+                    state = state.copy(listenerRecovering = true)
+                })
+        } } }
+        compose.onNodeWithText("通知连接已断开").assertExists()
+        capture("inbox-disconnected")
+        compose.onNodeWithText("重新连接").performClick()
+        compose.runOnIdle { assertEquals(1, reconnects); assertEquals(0, settingsRequests) }
+        compose.onNodeWithText("正在恢复通知连接…").assertExists()
+        compose.onNodeWithText("重新连接").assertIsNotEnabled()
+        capture("inbox-reconnecting")
+        compose.onNodeWithText("连接帮助").performClick()
+        compose.runOnIdle { assertEquals(1, settingsRequests) }
+        compose.runOnIdle { state = state.copy(listenerConnected = true, listenerRecovering = false) }
+        compose.onNodeWithText("正在恢复通知连接…").assertDoesNotExist()
+        compose.onNodeWithText("通知连接已断开").assertDoesNotExist()
+        compose.onNodeWithText("重新连接").assertDoesNotExist()
+    }
+
+    @Test fun sourceReconnectUsesRecoveryAndKeepsSystemAndBatteryHelpCollapsed() {
+        var state by mutableStateOf(QingxuUiState(loading = false, permissionGranted = true,
+            selectedPackages = setOf("chat.example")))
+        var reconnects = 0
+        var permissionRequests = 0
+        compose.setContent { QingxuTheme { Surface {
+            SourceSettingsScreen(state, onPermissionSettings = { permissionRequests++ },
+                onSelectSource = { _, _ -> }, onReconnect = {
+                    reconnects++
+                    state = state.copy(listenerRecovering = true)
+                })
+        } } }
+        compose.onNodeWithText("通知连接已断开").assertExists()
+        compose.onNodeWithText("后台管理", substring = true).assertDoesNotExist()
+        compose.onNodeWithText("重新连接").performClick()
+        compose.runOnIdle { assertEquals(1, reconnects); assertEquals(0, permissionRequests) }
+        compose.onNodeWithText("正在恢复通知连接…").assertExists()
+        compose.onNodeWithText("重新连接").assertIsNotEnabled()
+        compose.onNodeWithText("连接帮助").performClick()
+        compose.onNodeWithText("后台管理", substring = true).assertExists()
+        compose.onNodeWithText("打开系统通知设置").performClick()
+        compose.runOnIdle { assertEquals(1, permissionRequests) }
+        capture("source-connection-help")
+    }
+
     @Test @Config(qualifiers = "w393dp-h851dp-night-xxhdpi")
     fun darkInboxRenders() {
         compose.setContent {
@@ -261,21 +313,57 @@ class GuidedUiTest {
     @Test fun automaticInboxShowsUncertainMessagesAndKeepsHiddenMessagesOut() {
         val now = exampleEntry("now", "NOW", "transaction").copy(title = "退款失败，请补充资料", body = "请更新收款信息，以继续退款。")
         val later = exampleEntry("later", "LATER", "delivery").copy(title = "包裹运输中", body = "已离开分拨中心，正在送往下一站。")
-        val review = exampleEntry("review", "REVIEW", "unknown").copy(title = "待判断消息", body = "你关注的活动有新进展。")
+        val review = exampleEntry("review", "REVIEW", "unknown").copy(title = "活动有新进展", body = "你关注的活动有新进展。")
         val hidden = exampleEntry("hidden", "HIDDEN", "marketing").copy(title = "促销已收起")
+        val manuallyHidden = exampleEntry("manual-hidden", "HIDDEN", "marketing").copy(
+            userLabel = UserLabel.FILTERED, labelSource = "manual", manualVersion = 1)
         compose.setContent {
             QingxuTheme { Surface {
-                InboxScreen(QingxuUiState(entries = listOf(now, later, review, hidden),
+                InboxScreen(QingxuUiState(entries = listOf(now, later, review, hidden, manuallyHidden),
                     selectedPackages = setOf("shop.example"), permissionGranted = true,
                     listenerConnected = true, loading = false), {}, { _, _ -> }, {}, {})
             } }
         }
         capture("automatic-inbox")
-        listOf("现在看 · 1", "稍后看 · 1", "待确认 · 1").forEach { title ->
+        compose.onNodeWithText("已自动整理 3 条 · 收起 1 条").assertExists()
+        listOf("现在看 · 1", "稍后看 · 1", "其他消息 · 1").forEach { title ->
             compose.onNode(hasScrollAction()).performScrollToNode(hasText(title))
             compose.onNodeWithText(title).assertIsDisplayed()
         }
         compose.onNodeWithText("促销已收起").assertDoesNotExist()
+        compose.onNodeWithText("待确认", substring = true).assertDoesNotExist()
+        compose.onNodeWithText("不必逐条分类", substring = true).assertDoesNotExist()
+        compose.onNodeWithContentDescription("其他消息说明").performScrollTo().performClick()
+        compose.onNodeWithText("不必逐条分类", substring = true).assertExists()
+        compose.onNodeWithText("这条很重要").assertDoesNotExist()
+        capture("automatic-other-messages")
+    }
+
+    @Test fun localPlacementRemainsClearWhileCloudIsPendingUnavailableOrPaused() {
+        var entry by mutableStateOf(exampleEntry("local-first", "LATER", "message").copy(analysisStatus = "pending"))
+        compose.setContent { QingxuTheme { Surface {
+            Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(20.dp)) {
+                NotificationCard(entry, {}, {}, {}, {})
+            }
+        } } }
+        compose.onNodeWithText("本机已整理", substring = false).assertExists()
+        val statuses = listOf("retry" to "本机已整理 · 云端待重试", "retry2" to "本机已整理 · 云端待重试",
+            "failed" to "本机已整理 · 云端暂不可用", "privacy_waiting" to "本机已整理 · 锁屏暂停云端")
+        statuses.forEach { (status, label) ->
+            compose.runOnIdle { entry = entry.copy(analysisStatus = status) }
+            compose.onNodeWithText(label, substring = false).assertExists()
+            compose.onNodeWithText("云端分析", substring = false).assertDoesNotExist()
+        }
+        capture("local-first-cloud-paused")
+        compose.runOnIdle {
+            entry = entry.copy(machineBucket = "REVIEW", machineKind = "unknown", machineConfidence = 0.0,
+                body = "你收到一条新消息", analysisStatus = "retry")
+        }
+        compose.onNodeWithText("本机已整理", substring = true).assertDoesNotExist()
+        compose.onNodeWithText("云端待重试", substring = false).assertExists()
+        compose.runOnIdle { entry = entry.copy(analysisStatus = "local_only") }
+        compose.onNodeWithText("保留可见").assertExists()
+        compose.onNodeWithText("本机整理", substring = false).assertDoesNotExist()
     }
 
     @Test fun similarRuleHasExplicitScopeAndRequiresSeparateConfirmation() {

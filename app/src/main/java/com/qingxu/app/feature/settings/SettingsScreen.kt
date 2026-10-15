@@ -37,7 +37,8 @@ fun SettingsScreen(
                     SettingsDestination("整理哪些应用", when {
                         state.selectedPackages.isEmpty() -> "选择想整理的应用"
                         !state.permissionGranted -> "${state.selectedPackages.size} 个应用 · 需开启通知访问"
-                        !state.listenerConnected -> "${state.selectedPackages.size} 个应用 · 等待系统连接"
+                        !state.listenerConnected && state.listenerRecovering -> "${state.selectedPackages.size} 个应用 · 正在恢复连接"
+                        !state.listenerConnected -> "${state.selectedPackages.size} 个应用 · 连接已断开"
                         else -> "${state.selectedPackages.size} 个应用 · 已连接"
                     }, Icons.Outlined.Apps, onSources, highlighted = guideStep == 0 || guideStep == 1)
                     HorizontalDivider(Modifier.padding(horizontal = 20.dp))

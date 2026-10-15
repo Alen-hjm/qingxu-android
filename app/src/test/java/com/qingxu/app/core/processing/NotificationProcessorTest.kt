@@ -61,7 +61,7 @@ class NotificationProcessorTest {
         processor.processBatch(0)
         assertEquals(DecisionBucket.HIDDEN, dao.find("promo")!!.effectiveBucket())
         assertEquals(DecisionBucket.NOW, dao.find("refund")!!.effectiveBucket())
-        assertEquals(DecisionBucket.REVIEW, dao.find("ambiguous")!!.effectiveBucket())
+        assertEquals(DecisionBucket.LATER, dao.find("ambiguous")!!.effectiveBucket())
         assertEquals(0, calls)
     }
     @Test fun interestAndStarKeepPromotionsVisibleAndRestoreOverridesAutomation() = runBlocking {
@@ -90,7 +90,8 @@ class NotificationProcessorTest {
     @Test fun verificationCodeAndDisabledSourceRemainVisible() = runBlocking {
         capture("otp", "验证码123456，限时优惠")
         processor.processBatch(0)
-        assertEquals(DecisionBucket.REVIEW, dao.find("otp")!!.effectiveBucket())
+        assertEquals(DecisionBucket.LATER, dao.find("otp")!!.effectiveBucket())
+        assertEquals("local", dao.find("otp")!!.analysisSource)
         capture("disabled", "限时优惠，马上抢购")
         sources.setSelected("com.taobao.taobao", false)
         processor.processBatch(0)
@@ -171,8 +172,9 @@ class NotificationProcessorTest {
         for (attempt in 0..2) {
             assertEquals(attempt < 2, processor.processBatch(attempt))
             val result = dao.find("cloud-failure")!!
-            assertEquals(if (attempt < 2) "retry" else "failed", result.analysisStatus)
-            assertEquals(DecisionBucket.REVIEW, result.effectiveBucket())
+            assertEquals(listOf("retry", "retry2", "failed")[attempt], result.analysisStatus)
+            assertEquals(DecisionBucket.LATER, result.effectiveBucket())
+            assertEquals("local", result.analysisSource)
             assertFalse(result.machineReason.contains("private-provider-response-not-for-users"))
             assertEquals(attempt + 1, calls)
         }
@@ -223,7 +225,7 @@ class NotificationProcessorTest {
         assertPendingAndVisible("disabled-cloud")
         processor.processBatch(0)
         assertEquals("local_only", dao.find("disabled-cloud")!!.analysisStatus)
-        assertEquals(DecisionBucket.REVIEW, dao.find("disabled-cloud")!!.effectiveBucket())
+        assertEquals(DecisionBucket.LATER, dao.find("disabled-cloud")!!.effectiveBucket())
         assertEquals(1, calls)
     }
 
@@ -282,7 +284,7 @@ class NotificationProcessorTest {
         assertFalse(processor.processBatch(0))
         assertEquals(0, calls)
         assertEquals("privacy_waiting", dao.find("locked")!!.analysisStatus)
-        assertEquals(DecisionBucket.REVIEW, dao.find("locked")!!.effectiveBucket())
+        assertEquals(DecisionBucket.LATER, dao.find("locked")!!.effectiveBucket())
         locked = false
         processor.processBatch(0)
         assertEquals(1, calls)
@@ -360,6 +362,71 @@ class NotificationProcessorTest {
         capture("mixed", "订单有新的进展，请查看详情")
         processor.processBatch(0)
         assertEquals(DecisionBucket.REVIEW, dao.find("mixed")!!.effectiveBucket())
+    }
+
+    @Test fun wholeLocalBatchIsSortedBeforeTheFirstSlowCloudRequest() = runBlocking {
+        withTimeout(10_000) {
+            coroutineScope {
+                val entered = CompletableDeferred<Unit>()
+                val release = CompletableDeferred<Unit>()
+                configureFakeCloud { _, _, _ -> entered.complete(Unit); release.await(); hiddenCloudResult }
+                capture("cloud-first", "有新的进展，请查看详情")
+                capture("local-next", "退款失败，请补充资料")
+                capture("promotion-next", "限时优惠，马上抢购")
+                val request = async { processor.processBatch(0) }
+                entered.await()
+                try {
+                    assertEquals(DecisionBucket.NOW, dao.find("local-next")!!.effectiveBucket())
+                    assertEquals("done", dao.find("local-next")!!.analysisStatus)
+                    assertEquals(DecisionBucket.HIDDEN, dao.find("promotion-next")!!.effectiveBucket())
+                    assertEquals(DecisionBucket.LATER, dao.find("cloud-first")!!.effectiveBucket())
+                } finally { release.complete(Unit) }
+                request.await()
+                Unit
+            }
+        }
+    }
+
+    @Test fun freshNotificationDoesNotInheritOldRetriesOrTheirAttemptBudget() = runBlocking {
+        configureFakeCloud { _, _, _ -> error("provider offline") }
+        capture("old-retry", "有新的进展，请查看详情")
+        processor.processBatch(0, includeRetry = false)
+        capture("fresh", "还有一条新的进展，请查看详情")
+        // Even an old WorkRequest's attempt number cannot consume this row's first request budget.
+        processor.processBatch(99, includeRetry = false)
+        assertEquals("retry", dao.find("old-retry")!!.analysisStatus)
+        assertEquals("retry", dao.find("fresh")!!.analysisStatus)
+        assertEquals(2, calls)
+        processor.processBatch(0, onlyRetry = true)
+        assertEquals("retry2", dao.find("old-retry")!!.analysisStatus)
+        assertEquals("retry2", dao.find("fresh")!!.analysisStatus)
+        processor.processBatch(0, onlyRetry = true)
+        assertEquals("failed", dao.find("old-retry")!!.analysisStatus)
+        assertEquals("failed", dao.find("fresh")!!.analysisStatus)
+        assertEquals(0, dao.retryCount())
+    }
+
+    @Test fun cloudBudgetYieldsAndLeavesRemainingFreshRowsWithUsableLocalResults() = runBlocking {
+        configureFakeCloud { _, _, _ -> hiddenCloudResult }
+        repeat(5) { capture("cloud-$it", "作者更新了一篇文章 $it") }
+        processor.processBatch(0, includeRetry = false)
+        assertEquals(2, calls)
+        assertEquals(3, dao.pendingCount())
+        assertEquals(DecisionBucket.LATER, dao.find("cloud-4")!!.effectiveBucket())
+        processor.processBatch(0, includeRetry = false)
+        assertEquals(4, calls)
+        assertEquals(1, dao.pendingCount())
+    }
+
+    @Test fun sensitiveCodeNeverCallsCloudEvenWhenTheSourceIsExplicitlyAllowed() = runBlocking {
+        configureFakeCloud { _, _, _ -> error("Must not upload secrets") }
+        val now = System.currentTimeMillis()
+        dao.capture(CapturedNotification("secret", "com.taobao.taobao", "淘宝", "验证码123456", "", null, now, now, "otp"))
+        processor.processBatch(0)
+        assertEquals(DecisionBucket.NOW, dao.find("secret")!!.effectiveBucket())
+        assertEquals("local", dao.find("secret")!!.analysisSource)
+        assertEquals("local_only", dao.find("secret")!!.analysisStatus)
+        assertEquals(0, calls)
     }
 
     private suspend fun assertPendingAndVisible(key: String) {

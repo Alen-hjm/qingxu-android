@@ -38,105 +38,120 @@ class NotificationProcessor(
     /** Call with gate held whenever local preferences or selected sources change. */
     fun invalidatePolicy() { policyGeneration++ }
 
-    suspend fun processBatch(attempt: Int): Boolean = runner.withLock {
+    /** The retry budget belongs to each row, never to whichever WorkRequest happens to pick it up. */
+    @Suppress("UNUSED_PARAMETER")
+    suspend fun processBatch(attempt: Int, includeRetry: Boolean = true, onlyRetry: Boolean = false): Boolean = runner.withLock {
         beforeProcessing()
-        if (!deviceLocked()) dao.requeueCloudPaused()
-        var retry = false
-        val batch = dao.pending(8)
+        if (!deviceLocked() && dao.requeueCloudPaused() > 0 && onlyRetry) enqueue()
+        val batch = dao.pending(8, includeRetry = includeRetry, onlyRetry = onlyRetry)
+        val cloud = mutableListOf<PendingCloud>()
+        // Finish the whole local pass before starting any slow network request.
         for (entry in batch) {
-            if (!sources.accepts(entry.packageName)) {
-                gate.withLock {
-                    if (!sources.accepts(entry.packageName)) finish(entry,
-                        Decision(DecisionBucket.REVIEW, "unknown", "该应用已停止整理", 0.0), "paused")
+            gate.withLock localPass@ {
+                if (!sources.accepts(entry.packageName)) {
+                    finish(entry, Decision(DecisionBucket.REVIEW, "unknown", "该应用已停止整理", 0.0), "paused")
+                    return@localPass
                 }
-                continue
+                val snapshot = preferences.state.value
+                val privacy = privacySettings()
+                val local = LocalClassifier.classify(entry)
+                val fallback = LocalClassifier.fallback(entry)
+                val permission = CloudPrivacyGate.permission(entry, snapshot, privacy, deviceLocked())
+                val sensitive = CloudPrivacyGate.containsSensitiveSecret(entry.title + " " + entry.body)
+                val decision = if (sensitive && local?.bucket == DecisionBucket.HIDDEN) fallback else local ?: fallback
+                val status = when {
+                    sensitive -> "local_only"
+                    local != null -> "done"
+                    permission == CloudPermission.ALLOWED -> entry.analysisStatus
+                    permission == CloudPermission.LOCKED -> "privacy_waiting"
+                    else -> "local_only"
+                }
+                finish(entry, applyPreferences(entry, decision, snapshot), status)
+                if (!sensitive && local == null && permission == CloudPermission.ALLOWED) {
+                    cloud += PendingCloud(entry, snapshot, privacy, policyGeneration, fallback)
+                }
             }
-            val snapshot = preferences.state.value
-            val privacy = privacySettings()
-            val generation = policyGeneration
-            val local = LocalClassifier.classify(entry)
-            val permission = CloudPrivacyGate.permission(entry, snapshot, privacy, deviceLocked())
+        }
+        // Yield between small network batches so a backlog cannot monopolize the processor for minutes.
+        for (pending in cloud.take(MAX_CLOUD_REQUESTS)) {
+            val (entry, snapshot, privacy, generation, fallback) = pending
             var status = "done"
-            var usedCloud = false
-            var decision = if (CloudPrivacyGate.containsSensitiveSecret(entry.title + " " + entry.body)) {
-                Decision(DecisionBucket.REVIEW, "unknown", "可能包含验证码，保留在本机供你查看", 0.0)
-            } else local ?: if (permission == CloudPermission.ALLOWED) {
-                try {
-                    val connection = gate.withLock {
-                        val current = preferences.state.value
-                        if (current.revision == snapshot.revision && privacySettings().revision == privacy.revision && policyGeneration == generation &&
-                            CloudPrivacyGate.permission(entry, current, privacySettings(), deviceLocked()) == CloudPermission.ALLOWED &&
-                            sources.accepts(entry.packageName) && isCurrentPending(entry)) {
-                            connectionSnapshot()
-                        } else null
-                    }
-                    if (connection == null) { enqueue(); continue }
-                    usedCloud = true
-                    val guard = CloudRequestGuard {
-                        gate.withLock {
-                            val current = preferences.state.value
-                            if (current.revision != snapshot.revision || privacySettings().revision != privacy.revision ||
-                                policyGeneration != generation || !sources.accepts(entry.packageName) || !isCurrentPending(entry) ||
-                                CloudPrivacyGate.permission(entry, current, privacySettings(), deviceLocked()) != CloudPermission.ALLOWED) {
-                                throw AuthorizationChanged()
-                            }
-                        }
-                    }
-                    withContext(guard) {
-                        guard.check()
-                        cloudAnalyze(connection.first.copy(interests = CloudPrivacyGate.redact(connection.first.interests)),
-                            connection.second, CloudPrivacyGate.prepare(entry))
-                    }
-                } catch (_: AuthorizationChanged) {
-                    enqueue()
-                    continue
-                } catch (cancelled: CancellationException) {
-                    throw cancelled
-                } catch (_: Exception) {
-                    status = if (attempt < 2) "retry" else "failed"
-                    retry = retry || status == "retry"
-                    Decision(DecisionBucket.REVIEW, "unknown", if (status == "retry")
-                        "云端暂未完成，消息保留可见并稍后重试" else "云端分析失败，消息保留可见；可在设置重新整理", 0.0, "cloud")
+            val decision = try {
+                val connection = gate.withLock {
+                    if (isAuthorized(pending)) connectionSnapshot() else null
                 }
-            } else {
-                status = if (permission == CloudPermission.LOCKED) "privacy_waiting" else "local_only"
-                Decision(DecisionBucket.REVIEW, "unknown", when (permission) {
-                    CloudPermission.LOCKED -> "设备已锁定，未发送云端；解锁后继续整理"
-                    CloudPermission.LOCAL_ONLY -> "此来源仅在本机处理，暂不能确定，保留可见"
-                    else -> "本地规则暂不能确定，消息保留可见"
-                }, 0.0)
+                if (connection == null) { enqueue(); continue }
+                val guard = CloudRequestGuard {
+                    gate.withLock { if (!isAuthorized(pending)) throw AuthorizationChanged() }
+                }
+                withContext(guard) {
+                    guard.check()
+                    cloudAnalyze(connection.first.copy(interests = CloudPrivacyGate.redact(connection.first.interests)),
+                        connection.second, CloudPrivacyGate.prepare(entry))
+                }
+            } catch (_: AuthorizationChanged) {
+                enqueue()
+                continue
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                status = when (entry.analysisStatus) { "retry" -> "retry2"; "retry2" -> "failed"; else -> "retry" }
+                // A provider failure never takes away the useful on-device result or requests manual sorting.
+                fallback.copy(reason = if (status == "failed")
+                    "云端暂不可用，已按本机规则保留，可稍后重新整理"
+                else "已先按本机规则整理，云端稍后重试")
             }
             gate.withLock applyDecision@ {
                 if (preferences.state.value.revision != snapshot.revision || privacySettings().revision != privacy.revision ||
                     policyGeneration != generation || !sources.accepts(entry.packageName)) return@applyDecision
-                if (usedCloud && privacy.blockCloudWhenLocked && deviceLocked()) {
-                    finish(entry, Decision(DecisionBucket.REVIEW, "unknown", "设备已锁定，消息保留可见", 0.0), "privacy_waiting")
+                if (privacy.blockCloudWhenLocked && deviceLocked()) {
+                    finish(entry, applyPreferences(entry, fallback, snapshot), "privacy_waiting")
                     return@applyDecision
                 }
-                val latest = dao.find(entry.notificationKey) ?: return@applyDecision
-                decision = CloudDecisionPolicy.protect(entry, decision)
-                val preference = dao.rules().firstOrNull { it.packageName == entry.packageName && it.kind == decision.kind && it.hidden }
-                if (preference != null && decision.bucket != DecisionBucket.REVIEW) {
-                    decision = decision.copy(bucket = DecisionBucket.HIDDEN, reason = "按你的偏好收起此应用的这类消息", source = "preference")
-                } else if (decision.bucket == DecisionBucket.HIDDEN) {
-                    val terms = snapshot.interests.split(Regex("[,，;；\\n]" )).map { it.trim() }.filter { it.length >= 2 }
-                    val content = entry.title + " " + entry.body
-                    if (latest.interested || terms.any { content.contains(it, ignoreCase = true) }) {
-                        decision = decision.copy(bucket = DecisionBucket.LATER, reason = "命中你的关注内容，保留稍后查看", source = "preference")
-                    }
-                }
-                finish(entry, decision, status)
+                finish(entry, applyPreferences(entry, decision, snapshot), status)
             }
         }
-        if (batch.size == 8 && !retry) enqueue()
-        retry
+        // A full/partial network batch must drain even when one unrelated row is waiting for retry.
+        if (!onlyRetry && (batch.size == 8 || cloud.size > MAX_CLOUD_REQUESTS)) enqueue()
+        dao.retryCount() > 0
+    }
+
+    private data class PendingCloud(
+        val entry: NotificationEntry,
+        val settings: AiSettings,
+        val privacy: PrivacySettings,
+        val generation: Long,
+        val fallback: Decision,
+    )
+
+    private suspend fun isAuthorized(pending: PendingCloud): Boolean {
+        val current = preferences.state.value
+        return current.revision == pending.settings.revision && privacySettings().revision == pending.privacy.revision &&
+            policyGeneration == pending.generation && sources.accepts(pending.entry.packageName) && isCurrentPending(pending.entry) &&
+            CloudPrivacyGate.permission(pending.entry, current, privacySettings(), deviceLocked()) == CloudPermission.ALLOWED
+    }
+
+    private suspend fun applyPreferences(entry: NotificationEntry, input: Decision, settings: AiSettings): Decision {
+        var decision = CloudDecisionPolicy.protect(entry, input)
+        val latest = dao.find(entry.notificationKey) ?: return decision
+        val preference = dao.rules().firstOrNull { it.packageName == entry.packageName && it.kind == decision.kind && it.hidden }
+        if (preference != null && decision.bucket != DecisionBucket.REVIEW) {
+            decision = decision.copy(bucket = DecisionBucket.HIDDEN, reason = "按你的偏好收起此应用的这类消息", source = "preference")
+        } else if (decision.bucket == DecisionBucket.HIDDEN) {
+            val terms = settings.interests.split(Regex("[,，;；\\n]")).map { it.trim() }.filter { it.length >= 2 }
+            val content = entry.title + " " + entry.body
+            if (latest.interested || terms.any { content.contains(it, ignoreCase = true) }) {
+                decision = decision.copy(bucket = DecisionBucket.LATER, reason = "命中你的关注内容，保留稍后查看", source = "preference")
+            }
+        }
+        return decision
     }
 
     private suspend fun isCurrentPending(entry: NotificationEntry): Boolean {
         if (entry.postedAt <= privacySettings().deletedBefore) return false
         val current = dao.find(entry.notificationKey) ?: return false
         return current.contentVersion == entry.contentVersion && current.contentHash == entry.contentHash &&
-            current.labelSource != "manual" && current.analysisStatus in setOf("pending", "retry")
+            current.labelSource != "manual" && current.analysisStatus in setOf("pending", "retry", "retry2")
     }
 
     private class AuthorizationChanged : CancellationException("Cloud permission changed")
@@ -145,6 +160,8 @@ class NotificationProcessor(
         entry.notificationKey, entry.contentVersion, entry.contentHash, decision.bucket.name, decision.kind,
         decision.reason, decision.confidence, decision.source, status,
     )
+
+    private companion object { const val MAX_CLOUD_REQUESTS = 2 }
 }
 
 internal fun containsVerificationCode(text: String): Boolean = CloudPrivacyGate.containsSensitiveSecret(text)

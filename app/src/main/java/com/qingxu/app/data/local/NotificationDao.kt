@@ -12,6 +12,7 @@ import kotlinx.coroutines.Dispatchers
 import com.qingxu.app.core.privacy.NotificationCipher
 import com.qingxu.app.core.privacy.NotificationEncryptionException
 import com.qingxu.app.core.privacy.androidNotificationCipher
+import com.qingxu.app.core.decision.Decision
 
 @Dao
 abstract class NotificationDao {
@@ -37,8 +38,18 @@ abstract class NotificationDao {
     suspend fun save(entry: NotificationEntry) = saveStored(encrypt(entry))
 
     @Transaction
-    open suspend fun capture(incoming: CapturedNotification) {
-        save(mergeNotification(find(incoming.notificationKey), incoming))
+    open suspend fun capture(incoming: CapturedNotification, initialDecision: ((NotificationEntry) -> Decision)? = null) {
+        val previous = find(incoming.notificationKey)
+        val merged = mergeNotification(previous, incoming)
+        // Give the inbox a useful local placement in the same transaction as capture. A slow
+        // network request or delayed WorkManager job must not make categorizing a user's job.
+        val decision = if (initialDecision != null && merged.labelSource != "manual" &&
+            (previous == null || previous.contentHash != incoming.contentHash)) initialDecision(merged) else null
+        save(if (decision == null) merged else merged.copy(
+            machineBucket = decision.bucket.name, machineKind = decision.kind,
+            machineReason = decision.reason, machineConfidence = decision.confidence,
+            analysisSource = decision.source,
+        ))
     }
 
     @Query("""UPDATE notifications SET
@@ -70,26 +81,41 @@ abstract class NotificationDao {
     @Query("UPDATE notifications SET removedAt = :at WHERE notificationKey = :key")
     abstract suspend fun markRemoved(key: String, at: Long)
 
-    @Query("""SELECT * FROM notifications WHERE analysisStatus IN ('pending', 'retry')
-        AND labelSource != 'manual' ORDER BY updatedAt ASC LIMIT :limit""")
-    protected abstract suspend fun pendingStored(limit: Int): List<NotificationEntry>
+    @Query("""SELECT * FROM notifications
+        WHERE ((NOT :onlyRetry AND analysisStatus = 'pending')
+            OR (:includeRetry AND analysisStatus IN ('retry', 'retry2')))
+        AND labelSource != 'manual'
+        ORDER BY CASE WHEN analysisStatus = 'pending' THEN 0 ELSE 1 END, updatedAt ASC LIMIT :limit""")
+    protected abstract suspend fun pendingStored(limit: Int, includeRetry: Boolean, onlyRetry: Boolean): List<NotificationEntry>
 
-    suspend fun pending(limit: Int = 30): List<NotificationEntry> = pendingStored(limit).map(::decrypt)
+    suspend fun pending(limit: Int = 30, includeRetry: Boolean = true, onlyRetry: Boolean = false): List<NotificationEntry> =
+        pendingStored(limit, includeRetry, onlyRetry).map(::decrypt)
 
-    @Query("""SELECT COUNT(*) FROM notifications WHERE analysisStatus IN ('pending', 'retry')
+    @Query("""SELECT COUNT(*) FROM notifications WHERE analysisStatus IN ('pending', 'retry', 'retry2')
         AND labelSource != 'manual'""")
     abstract suspend fun pendingCount(): Int
+
+    @Query("""SELECT COUNT(*) FROM notifications WHERE analysisStatus IN ('retry', 'retry2')
+        AND labelSource != 'manual'""")
+    abstract suspend fun retryCount(): Int
 
     @Query("""UPDATE notifications SET analysisStatus = 'pending'
         WHERE analysisStatus = 'privacy_waiting' AND labelSource != 'manual'""")
     abstract suspend fun requeueCloudPaused(): Int
+
+    /** Upgrade only unresolved legacy local results; do not replace completed cloud decisions. */
+    @Query("""UPDATE notifications SET analysisStatus = 'pending'
+        WHERE packageName IN (:packages) AND labelSource != 'manual' AND machineBucket = 'REVIEW'
+        AND analysisStatus NOT IN ('pending', 'retry', 'retry2')
+        AND (analysisSource IN ('', 'local', 'cloud') OR analysisStatus = 'privacy_waiting')""")
+    abstract suspend fun requeueLegacyLocalResults(packages: List<String>): Int
 
     /** A delayed result can never overwrite new content or a correction made while it was in flight. */
     @Query("""UPDATE notifications SET machineBucket = :bucket, machineKind = :kind,
         machineReason = :reason, machineConfidence = :confidence, analysisSource = :source,
         analysisStatus = :status
         WHERE notificationKey = :key AND contentVersion = :version AND contentHash = :hash
-        AND labelSource != 'manual' AND analysisStatus IN ('pending', 'retry')
+        AND labelSource != 'manual' AND analysisStatus IN ('pending', 'retry', 'retry2')
         AND storageEncryptionVersion = 1""")
     protected abstract suspend fun finishStoredAnalysis(
         key: String, version: Int, hash: String, bucket: String, kind: String,

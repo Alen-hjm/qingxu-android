@@ -4,6 +4,7 @@ import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
 import android.app.Application
 import com.qingxu.app.core.decision.DecisionBucket
+import com.qingxu.app.core.decision.Decision
 import com.qingxu.app.core.decision.effectiveBucket
 import kotlinx.coroutines.runBlocking
 import org.junit.After
@@ -153,5 +154,55 @@ class NotificationDaoTest {
         assertEquals("retry", dao.pending().single().analysisStatus)
         assertEquals(1, finish())
         assertEquals(0, dao.pendingCount())
+    }
+
+    @Test fun capturePublishesLocalPlacementBeforeBackgroundAnalysisAndKeepsCorrections() = runBlocking {
+        val initial = { _: NotificationEntry -> Decision(DecisionBucket.NOW, "message", "明确急事", .92) }
+        dao.capture(incoming, initial)
+        assertEquals(DecisionBucket.NOW, dao.find("key")!!.effectiveBucket())
+        assertEquals("pending", dao.find("key")!!.analysisStatus)
+        assertEquals("local", dao.find("key")!!.analysisSource)
+        // Background analysis still owns the final machine result; duplicate snapshots don't reset it.
+        finish(bucket = "LATER")
+        dao.capture(incoming, initial)
+        assertEquals(DecisionBucket.LATER, dao.find("key")!!.effectiveBucket())
+        dao.classify("key", UserLabel.FILTERED)
+        dao.capture(incoming, initial)
+        assertEquals(DecisionBucket.HIDDEN, dao.find("key")!!.effectiveBucket())
+        // A new message reusing the notification key expires only the correction for the old text.
+        dao.capture(incoming.copy(body = "请马上回复", contentHash = "hash-2"), initial)
+        assertEquals(DecisionBucket.NOW, dao.find("key")!!.effectiveBucket())
+        assertEquals(2, dao.find("key")!!.contentVersion)
+    }
+
+    @Test fun freshNotificationsAreIndependentOfRetryBacklogAndSecondRetryCanFinish() = runBlocking {
+        dao.capture(incoming)
+        dao.finishAnalysis("key", 1, "hash-1", "LATER", "unknown", "本机已整理", .5, "local", "retry2")
+        dao.capture(incoming.copy(notificationKey = "fresh", capturedAt = 3L))
+        assertEquals(listOf("fresh", "key"), dao.pending().map { it.notificationKey })
+        assertEquals(listOf("fresh"), dao.pending(includeRetry = false).map { it.notificationKey })
+        assertEquals(listOf("key"), dao.pending(onlyRetry = true).map { it.notificationKey })
+        assertEquals(2, dao.pendingCount())
+        assertEquals(1, dao.retryCount())
+        assertEquals(1, finish(bucket = "NOW"))
+        assertEquals(0, dao.retryCount())
+    }
+
+    @Test fun upgradingSortingRevisitsOnlyUnresolvedLocalResultsFromSelectedApps() = runBlocking {
+        suspend fun add(key: String, source: String = "local", bucket: String = "REVIEW") {
+            dao.capture(incoming.copy(notificationKey = key))
+            dao.finishAnalysis(key, 1, "hash-1", bucket, "unknown", "此前规则不足", .0, source, "local_only")
+        }
+        add("local")
+        add("cloud", "ai")
+        add("manual")
+        dao.classify("manual", UserLabel.UNSORTED)
+        add("classified", bucket = "LATER")
+        dao.capture(incoming.copy(notificationKey = "unselected", packageName = "other.app"))
+        dao.finishAnalysis("unselected", 1, "hash-1", "REVIEW", "unknown", "此前规则不足", .0, "local", "local_only")
+        assertEquals(1, dao.requeueLegacyLocalResults(listOf("example.app")))
+        assertEquals(listOf("local"), dao.pending().map { it.notificationKey })
+        assertEquals(DecisionBucket.LATER, dao.find("classified")!!.effectiveBucket())
+        assertEquals("manual", dao.find("manual")!!.analysisStatus)
     }
 }

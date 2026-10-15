@@ -4,6 +4,8 @@ import android.util.Log
 import com.qingxu.app.data.local.CapturedNotification
 import com.qingxu.app.data.local.NotificationDao
 import com.qingxu.app.data.local.UserLabel
+import com.qingxu.app.data.local.NotificationEntry
+import com.qingxu.app.core.decision.Decision
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -23,6 +25,7 @@ class NotificationRepository(
     private val ensureReady: suspend () -> Unit = {},
     private val acceptCapture: (CapturedNotification) -> Boolean = { true },
     private val mutationGate: Mutex = Mutex(),
+    private val initialDecision: ((NotificationEntry) -> Decision)? = null,
     private val onCaptured: () -> Unit = {},
 ) {
     // One application-owned queue preserves callback order, including across service restarts.
@@ -58,7 +61,7 @@ class NotificationRepository(
         mutationGate.withLock {
             if (!sources.accepts(notification.packageName)) return
             if (!acceptCapture(notification)) return
-            dao.capture(notification)
+            dao.capture(notification, initialDecision)
             onCaptured()
         }
     }

@@ -17,6 +17,10 @@ import com.qingxu.app.core.privacy.deviceIsPrivate
 import com.qingxu.app.data.local.MIGRATION_2_3
 import com.qingxu.app.data.local.initializeNotificationEncryption
 import com.qingxu.app.data.local.compactNotificationStorage
+import com.qingxu.app.core.decision.LocalClassifier
+import com.qingxu.app.core.decision.CloudDecisionPolicy
+import com.qingxu.app.core.decision.DecisionBucket
+import com.qingxu.app.notification.NotificationConnectionRecovery
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
@@ -27,6 +31,7 @@ class QingxuApplication : Application(), Configuration.Provider {
     val container by lazy { AppContainer(this) }
     override fun onCreate() {
         super.onCreate()
+        NotificationConnectionRecovery.install(this)
         AnalysisScheduler.installRepair(this)
         AnalysisScheduler.enqueue(this)
     }
@@ -60,6 +65,10 @@ class AppContainer(application: Application) {
                 check(storagePrefs.edit().putBoolean("deletion_compaction_pending", false)
                     .putLong("deletion_cutoff_compacted", privacy.state.value.deletedBefore).commit())
             }
+            if (!storagePrefs.getBoolean("automatic_sorting_v2", false)) {
+                dao.requeueLegacyLocalResults(sources.selected.value.toList())
+                check(storagePrefs.edit().putBoolean("automatic_sorting_v2", true).commit())
+            }
             storageReady = true
         }
     }
@@ -90,6 +99,16 @@ class AppContainer(application: Application) {
         privacySettings = { privacy.state.value }, deviceLocked = { deviceIsPrivate(application) },
         beforeProcessing = { maintainStorage() }) { AnalysisScheduler.enqueue(application) }
     val repository = NotificationRepository(dao, sources, ensureReady = { ensureStorageReady() }, mutationGate = storageMutationGate,
+        initialDecision = { entry ->
+            val decision = CloudDecisionPolicy.protect(entry,
+                LocalClassifier.classify(entry) ?: LocalClassifier.fallback(entry))
+            val interests = ai.state.value.interests.split(Regex("[,，;；\\n]"))
+                .map { it.trim() }.filter { it.length >= 2 }
+            if (decision.bucket == DecisionBucket.HIDDEN && (entry.interested ||
+                interests.any { (entry.title + " " + entry.body).contains(it, ignoreCase = true) })) {
+                decision.copy(bucket = DecisionBucket.LATER, reason = "命中你的关注内容，保留稍后查看", source = "preference")
+            } else decision
+        },
         acceptCapture = { it.postedAt > privacy.state.value.deletedBefore &&
             (privacy.state.value.retentionDays == 0 || it.postedAt >= System.currentTimeMillis() - privacy.state.value.retentionDays * 86_400_000L) }) {
         AnalysisScheduler.enqueue(application)

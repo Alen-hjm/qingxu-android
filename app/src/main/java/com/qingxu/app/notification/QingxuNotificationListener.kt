@@ -3,6 +3,7 @@ package com.qingxu.app.notification
 import android.app.Notification
 import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
+import android.util.Log
 import com.qingxu.app.QingxuApplication
 import com.qingxu.app.data.local.CapturedNotification
 import java.lang.ref.WeakReference
@@ -12,36 +13,58 @@ class QingxuNotificationListener : NotificationListenerService() {
     private val appLabels = mutableMapOf<String, String>()
     private val container get() = (application as QingxuApplication).container
 
-    override fun onCreate() {
-        super.onCreate()
-        instance = WeakReference(this)
-    }
-
     override fun onListenerConnected() {
         super.onListenerConnected()
+        instance = WeakReference(this)
         NotificationActions.setConnected(true)
+        NotificationConnectionRecovery.onConnected(this)
         captureActive()
     }
 
     override fun onListenerDisconnected() {
-        NotificationActions.setConnected(false)
+        markDisconnected()
         super.onListenerDisconnected()
     }
 
-    override fun onNotificationPosted(sbn: StatusBarNotification) { capture(sbn) }
+    override fun onNotificationPosted(sbn: StatusBarNotification) {
+        if (instance?.get() === this) captureSafely(sbn)
+    }
 
     override fun onNotificationRemoved(sbn: StatusBarNotification) {
-        NotificationActions.remove(sbn.key)
-        container.repository.enqueueRemoval(sbn.key, System.currentTimeMillis())
+        if (instance?.get() !== this) return
+        handleNotificationSafely {
+            NotificationActions.remove(sbn.key)
+            container.repository.enqueueRemoval(sbn.key, System.currentTimeMillis())
+        }
     }
 
     private fun captureActive() {
-        if (!NotificationActions.connected.value) return
-        try {
-            activeNotifications?.forEach(::capture)
-        } catch (_: SecurityException) {
-            NotificationActions.setConnected(false)
+        if (instance?.get() !== this || !NotificationActions.connected.value) return
+        val active = try {
+            activeNotifications
+        } catch (failure: RuntimeException) {
+            reportFailure(failure)
+            markDisconnected()
+            return
         }
+        if (active == null) {
+            markDisconnected()
+            return
+        }
+        active.forEach(::captureSafely)
+    }
+
+    private fun captureSafely(sbn: StatusBarNotification) {
+        handleNotificationSafely { capture(sbn) }
+    }
+
+    private fun markDisconnected() {
+        val owner = instance?.get()
+        // A late callback from an older service must not take the replacement offline.
+        if (owner != null && owner !== this) return
+        instance = null
+        NotificationActions.setConnected(false)
+        NotificationConnectionRecovery.request(this)
     }
 
     private fun capture(sbn: StatusBarNotification) {
@@ -77,8 +100,7 @@ class QingxuNotificationListener : NotificationListenerService() {
     }
 
     override fun onDestroy() {
-        NotificationActions.setConnected(false)
-        if (instance?.get() === this) instance = null
+        markDisconnected()
         super.onDestroy()
     }
 
@@ -87,4 +109,18 @@ class QingxuNotificationListener : NotificationListenerService() {
         /** Called on the main thread after the user enables a source. */
         fun refreshActive() { instance?.get()?.captureActive() }
     }
+}
+
+/** A malformed notification must not interrupt later callbacks or active-notification sync. */
+internal fun handleNotificationSafely(handle: () -> Unit) {
+    try {
+        handle()
+    } catch (failure: RuntimeException) {
+        reportFailure(failure)
+    }
+}
+
+private fun reportFailure(failure: RuntimeException) {
+    // Do not include exception messages, titles, bodies, or the notification's originating app.
+    Log.w("NotificationCapture", "Notification callback failed (${failure.javaClass.simpleName})")
 }

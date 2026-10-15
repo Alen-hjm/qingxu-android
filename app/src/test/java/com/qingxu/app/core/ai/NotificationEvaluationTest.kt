@@ -41,7 +41,7 @@ class NotificationEvaluationTest {
                 interested = item.optBoolean("interested", false))
             val expected = item.getJSONArray("expected").let { array -> (0 until array.length()).map { array.getString(it) }.toSet() }
             val raw = LocalClassifier.classify(entry, now)
-                ?: Decision(DecisionBucket.REVIEW, "unknown", "本地规则未覆盖", 0.0)
+                ?: LocalClassifier.fallback(entry, now)
             val protected = CloudDecisionPolicy.protect(entry, raw, now)
             // User interest is a processor override. This test records it explicitly without networking.
             val result = if (protected.bucket == DecisionBucket.HIDDEN &&

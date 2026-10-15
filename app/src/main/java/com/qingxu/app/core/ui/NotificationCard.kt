@@ -178,16 +178,22 @@ fun NotificationCard(entry: NotificationEntry, onClassify: (UserLabel) -> Unit, 
     }
 }
 
-private fun decisionSource(entry: NotificationEntry): String = when {
-    entry.hasCurrentCorrection() -> "你已调整"
-    entry.analysisStatus == "pending" -> "正在整理"
-    entry.analysisStatus == "retry" -> "等待重试"
-    entry.analysisStatus in setOf("error", "failed") -> "分析未完成"
-    entry.analysisStatus == "privacy_waiting" -> "锁屏暂停云端"
-    entry.analysisSource == "jev" -> "Jev 云端判断"
-    entry.analysisSource == "ai" -> "云端分析"
-    entry.analysisSource in setOf("rule", "preference") -> "按你的规则"
-    else -> "本机整理"
+private fun decisionSource(entry: NotificationEntry): String {
+    if (entry.hasCurrentCorrection()) return "你已调整"
+    val locallyOrganized = entry.analysisSource in setOf("local", "rule", "preference") &&
+        entry.effectiveBucket() != DecisionBucket.REVIEW
+    val localPrefix = if (locallyOrganized) "本机已整理 · " else ""
+    return when {
+        entry.analysisStatus == "pending" -> if (locallyOrganized) "本机已整理" else "正在整理"
+        entry.analysisStatus in setOf("retry", "retry2") -> localPrefix + "云端待重试"
+        entry.analysisStatus in setOf("error", "failed") -> localPrefix + "云端暂不可用"
+        entry.analysisStatus == "privacy_waiting" -> localPrefix + "锁屏暂停云端"
+        entry.analysisSource == "jev" -> "Jev 云端判断"
+        entry.analysisSource == "ai" -> "云端分析"
+        entry.analysisSource in setOf("rule", "preference") -> "按你的规则"
+        entry.effectiveBucket() == DecisionBucket.REVIEW -> "保留可见"
+        else -> "本机整理"
+    }
 }
 
 private fun notificationKindName(kind: String): String? = when (kind) {

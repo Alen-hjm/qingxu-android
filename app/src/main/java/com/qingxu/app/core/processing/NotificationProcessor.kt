@@ -17,6 +17,8 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import com.qingxu.app.core.privacy.CloudPrivacyGate
 import com.qingxu.app.core.privacy.CloudPermission
 import com.qingxu.app.core.privacy.PrivacySettings
@@ -35,6 +37,8 @@ class NotificationProcessor(
     // Also guards policy changes against late network results in the same process.
     val gate = Mutex()
     private val runner = Mutex()
+    private val mutableActivity = MutableStateFlow(ProcessingActivity())
+    val activity = mutableActivity.asStateFlow()
     var policyGeneration: Long = 0
         private set
     /** Call with gate held whenever local preferences or selected sources change. */
@@ -81,40 +85,51 @@ class NotificationProcessor(
         // Yield between small network batches so a backlog cannot monopolize the processor for minutes.
         for (pending in cloud.take(MAX_CLOUD_REQUESTS)) {
             val (entry, snapshot, privacy, generation, fallback) = pending
-            var status = "done"
-            val decision = try {
-                val connection = gate.withLock {
-                    if (isAuthorized(pending)) connectionSnapshot() else null
+            var requestStarted = false
+            try {
+                var status = "done"
+                val decision = try {
+                    val connection = gate.withLock {
+                        if (isAuthorized(pending)) connectionSnapshot() else null
+                    }
+                    if (connection == null) { enqueue(); continue }
+                    val guard = CloudRequestGuard {
+                        gate.withLock { if (!isAuthorized(pending)) throw AuthorizationChanged() }
+                    }
+                    withContext(guard) {
+                        guard.check()
+                        mutableActivity.value = ProcessingActivity(running = true, settingsRevision = snapshot.revision,
+                            provider = snapshot.provider)
+                        requestStarted = true
+                        cloudAnalyze(connection.first.copy(interests = CloudPrivacyGate.redact(connection.first.interests)),
+                            connection.second, CloudPrivacyGate.prepare(entry))
+                    }
+                } catch (_: AuthorizationChanged) {
+                    enqueue()
+                    continue
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (_: Exception) {
+                    recordOutcome(snapshot, ProcessingOutcome.FAILED)
+                    status = when (entry.analysisStatus) { "retry" -> "retry2"; "retry2" -> "failed"; else -> "retry" }
+                    // A provider failure never takes away the useful on-device result or requests manual sorting.
+                    fallback.copy(reason = if (status == "failed")
+                        "云端暂不可用，已按本机规则保留，可稍后重新整理"
+                    else "已先按本机规则整理，云端稍后重试")
                 }
-                if (connection == null) { enqueue(); continue }
-                val guard = CloudRequestGuard {
-                    gate.withLock { if (!isAuthorized(pending)) throw AuthorizationChanged() }
+                gate.withLock applyDecision@ {
+                    if (preferences.state.value.revision != snapshot.revision || privacySettings().revision != privacy.revision ||
+                        policyGeneration != generation || !sources.accepts(entry.packageName) || !isCurrentPending(entry)) return@applyDecision
+                    if (privacy.blockCloudWhenLocked && deviceLocked()) {
+                        finish(entry, applyPreferences(entry, fallback, snapshot), "privacy_waiting")
+                        return@applyDecision
+                    }
+                    val applied = finish(entry, applyPreferences(entry, decision, snapshot), status)
+                    if (applied > 0 && status == "done") recordOutcome(snapshot, ProcessingOutcome.SUCCEEDED)
                 }
-                withContext(guard) {
-                    guard.check()
-                    cloudAnalyze(connection.first.copy(interests = CloudPrivacyGate.redact(connection.first.interests)),
-                        connection.second, CloudPrivacyGate.prepare(entry))
-                }
-            } catch (_: AuthorizationChanged) {
-                enqueue()
-                continue
-            } catch (cancelled: CancellationException) {
-                throw cancelled
-            } catch (_: Exception) {
-                status = when (entry.analysisStatus) { "retry" -> "retry2"; "retry2" -> "failed"; else -> "retry" }
-                // A provider failure never takes away the useful on-device result or requests manual sorting.
-                fallback.copy(reason = if (status == "failed")
-                    "云端暂不可用，已按本机规则保留，可稍后重新整理"
-                else "已先按本机规则整理，云端稍后重试")
-            }
-            gate.withLock applyDecision@ {
-                if (preferences.state.value.revision != snapshot.revision || privacySettings().revision != privacy.revision ||
-                    policyGeneration != generation || !sources.accepts(entry.packageName) || !isCurrentPending(entry)) return@applyDecision
-                if (privacy.blockCloudWhenLocked && deviceLocked()) {
-                    finish(entry, applyPreferences(entry, fallback, snapshot), "privacy_waiting")
-                    return@applyDecision
-                }
-                finish(entry, applyPreferences(entry, decision, snapshot), status)
+            } finally {
+                // Cancellation, stale rows and revoked permission must never look like a successful sort.
+                if (requestStarted && mutableActivity.value.running) recordOutcome(snapshot, ProcessingOutcome.DISCARDED)
             }
         }
         // A full/partial network batch must drain even when one unrelated row is waiting for retry.
@@ -129,6 +144,11 @@ class NotificationProcessor(
         val generation: Long,
         val fallback: Decision,
     )
+
+    private fun recordOutcome(settings: AiSettings, outcome: ProcessingOutcome) {
+        mutableActivity.value = ProcessingActivity(settingsRevision = settings.revision,
+            provider = settings.provider, lastOutcome = outcome, lastCompletedAt = System.currentTimeMillis())
+    }
 
     private suspend fun isAuthorized(pending: PendingCloud): Boolean {
         val current = preferences.state.value

@@ -15,6 +15,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.emitAll
+import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -34,7 +35,7 @@ class NotificationRepository(
     private val events = Channel<Event>(Channel.UNLIMITED)
     private val mutableCaptureFailed = MutableStateFlow(false)
     val captureFailed = mutableCaptureFailed.asStateFlow()
-    val entries = flow { ensureReady(); emitAll(dao.observeAll()) }
+    val entries = flow { ensureReady(); emitAll(dao.observeAll()) }.flowOn(Dispatchers.IO)
 
     init {
         scope.launch {
@@ -62,9 +63,9 @@ class NotificationRepository(
         mutationGate.withLock {
             if (!sources.accepts(notification.packageName)) return
             if (!acceptCapture(notification)) return
-            dao.capture(notification, initialDecision)
+            val changed = dao.captureIfChanged(notification, initialDecision)
             onPersisted(notification)
-            onCaptured()
+            if (changed) onCaptured()
         }
     }
     suspend fun classify(key: String, label: UserLabel, version: Int, hash: String) = dao.classify(key, label, version, hash)

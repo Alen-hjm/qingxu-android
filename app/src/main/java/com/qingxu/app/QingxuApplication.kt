@@ -27,6 +27,8 @@ import com.qingxu.app.core.decision.DecisionBucket
 import com.qingxu.app.notification.NotificationConnectionRecovery
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
 class QingxuApplication : Application(), Configuration.Provider {
     override val workManagerConfiguration: Configuration
@@ -51,30 +53,32 @@ class AppContainer(application: Application) {
     private val storageGate = Mutex()
     private val storageMutationGate = Mutex()
     private var storageReady = false
-    suspend fun ensureStorageReady() = storageGate.withLock {
-        if (!storageReady) {
-            // Replay the committed deletion marker before any row can be observed or uploaded.
-            if (privacy.state.value.deletedBefore > 0) {
-                if (privacy.state.value.deletedBefore > storagePrefs.getLong("deletion_cutoff_compacted", 0)) {
-                    check(storagePrefs.edit().putBoolean("deletion_compaction_pending", true).commit())
+    suspend fun ensureStorageReady() = withContext(Dispatchers.IO) {
+        storageGate.withLock {
+            if (!storageReady) {
+                // Replay the committed deletion marker before any row can be observed or uploaded.
+                if (privacy.state.value.deletedBefore > 0) {
+                    if (privacy.state.value.deletedBefore > storagePrefs.getLong("deletion_cutoff_compacted", 0)) {
+                        check(storagePrefs.edit().putBoolean("deletion_compaction_pending", true).commit())
+                    }
+                    dao.deleteNotificationsPostedAtOrBefore(privacy.state.value.deletedBefore)
                 }
-                dao.deleteNotificationsPostedAtOrBefore(privacy.state.value.deletedBefore)
+                database.initializeNotificationEncryption()
+                if (!storagePrefs.getBoolean("v3_pages_compacted", false)) {
+                    database.compactNotificationStorage()
+                    check(storagePrefs.edit().putBoolean("v3_pages_compacted", true).commit())
+                }
+                if (storagePrefs.getBoolean("deletion_compaction_pending", false)) {
+                    database.compactNotificationStorage()
+                    check(storagePrefs.edit().putBoolean("deletion_compaction_pending", false)
+                        .putLong("deletion_cutoff_compacted", privacy.state.value.deletedBefore).commit())
+                }
+                if (!storagePrefs.getBoolean("automatic_sorting_v2", false)) {
+                    dao.requeueLegacyLocalResults(sources.selected.value.toList())
+                    check(storagePrefs.edit().putBoolean("automatic_sorting_v2", true).commit())
+                }
+                storageReady = true
             }
-            database.initializeNotificationEncryption()
-            if (!storagePrefs.getBoolean("v3_pages_compacted", false)) {
-                database.compactNotificationStorage()
-                check(storagePrefs.edit().putBoolean("v3_pages_compacted", true).commit())
-            }
-            if (storagePrefs.getBoolean("deletion_compaction_pending", false)) {
-                database.compactNotificationStorage()
-                check(storagePrefs.edit().putBoolean("deletion_compaction_pending", false)
-                    .putLong("deletion_cutoff_compacted", privacy.state.value.deletedBefore).commit())
-            }
-            if (!storagePrefs.getBoolean("automatic_sorting_v2", false)) {
-                dao.requeueLegacyLocalResults(sources.selected.value.toList())
-                check(storagePrefs.edit().putBoolean("automatic_sorting_v2", true).commit())
-            }
-            storageReady = true
         }
     }
     suspend fun maintainStorage() {
@@ -118,9 +122,10 @@ class AppContainer(application: Application) {
         },
         acceptCapture = { it.postedAt > privacy.state.value.deletedBefore &&
             (privacy.state.value.retentionDays == 0 || it.postedAt >= System.currentTimeMillis() - privacy.state.value.retentionDays * 86_400_000L) },
-        onPersisted = { delivery.recordPersisted(it.postedAt); surface.refresh() }) {
+        onPersisted = { delivery.recordPersisted(it.postedAt) }) {
+        surface.refresh()
         AnalysisScheduler.enqueue(application)
     }
     val surface = NotificationSurface(application, dao, surfacePreferences, processor.gate,
-        selected = { sources.selected.value }, ensureReady = { maintainStorage() })
+        selected = { sources.selected.value }, ensureReady = { ensureStorageReady() })
 }

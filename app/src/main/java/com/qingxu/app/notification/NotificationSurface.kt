@@ -16,7 +16,6 @@ import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
@@ -48,14 +47,17 @@ class NotificationSurface(
     init {
         scope.launch {
             for (ignored in requests) try {
-                ensureReady()
+                // Both features are opt-in. The default path must never open/decrypt the inbox.
                 gate.withLock {
-                    val entries = dao.observeAll().first().filter { it.packageName in selected() }
                     val settings = prefs.state.value
+                    if (settings.summary || settings.removePromotions) ensureReady()
+                    val packages = selected().toList()
+                    val priorityCount = if (settings.summary) dao.prioritySummaryCount(packages) else 0
+                    val promotions = if (settings.removePromotions && NotificationAccess.granted(context))
+                        dao.promotionCandidates(packages).filter { it.canRemovePromotion() } else emptyList()
                     withContext(Dispatchers.Main.immediate) {
-                        updateSummary(if (settings.summary) entries.count { it.handledAt == null && it.displayBucket() == DecisionBucket.NOW } else 0)
-                        if (settings.removePromotions && NotificationAccess.granted(context))
-                            entries.filter { it.canRemovePromotion() && it.removedAt == null }.forEach { QingxuNotificationListener.removeConfirmedPromotion(it) }
+                        updateSummary(priorityCount)
+                        promotions.forEach { QingxuNotificationListener.removeConfirmedPromotion(it) }
                     }
                 }
             } catch (cancelled: CancellationException) { throw cancelled

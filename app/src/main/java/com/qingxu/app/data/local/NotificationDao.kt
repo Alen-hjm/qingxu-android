@@ -6,13 +6,18 @@ import androidx.room.OnConflictStrategy
 import androidx.room.Query
 import androidx.room.Transaction
 import kotlinx.coroutines.flow.Flow
-import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import com.qingxu.app.core.privacy.NotificationCipher
 import com.qingxu.app.core.privacy.NotificationEncryptionException
 import com.qingxu.app.core.privacy.androidNotificationCipher
 import com.qingxu.app.core.decision.Decision
+import com.qingxu.app.core.decision.DecisionBucket
+import com.qingxu.app.core.decision.displayBucket
 
 @Dao
 abstract class NotificationDao {
@@ -24,22 +29,51 @@ abstract class NotificationDao {
     @Query("SELECT * FROM notifications ORDER BY postedAt DESC")
     protected abstract fun observeStored(): Flow<List<NotificationEntry>>
 
-    fun observeAll(): Flow<List<NotificationEntry>> = observeStored()
-        .map { entries -> entries.map(::decrypt) }.flowOn(Dispatchers.IO)
+    /** Reuse unchanged encrypted fields only while this collector is alive, never across sessions. */
+    fun observeAll(): Flow<List<NotificationEntry>> = flow {
+        var previous = emptyMap<String, Pair<NotificationEntry, NotificationEntry>>()
+        var previousCipher = cipher
+        try {
+            observeStored().collect { stored ->
+                if (previousCipher !== cipher) {
+                    previous = emptyMap()
+                    previousCipher = cipher
+                }
+                val next = stored.associate { entry ->
+                    val cached = previous[entry.notificationKey]
+                    entry.notificationKey to (entry to decrypt(entry, cached))
+                }
+                previous = next
+                emit(next.values.map { it.second })
+            }
+        } finally {
+            previous = emptyMap()
+        }
+    }.distinctUntilChanged().flowOn(Dispatchers.IO)
 
     @Query("SELECT * FROM notifications WHERE notificationKey = :key")
     protected abstract suspend fun findStored(key: String): NotificationEntry?
 
-    suspend fun find(key: String): NotificationEntry? = findStored(key)?.let(::decrypt)
+    suspend fun find(key: String): NotificationEntry? = withContext(Dispatchers.IO) { findStored(key)?.let(::decrypt) }
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     protected abstract suspend fun saveStored(entry: NotificationEntry)
 
-    suspend fun save(entry: NotificationEntry) = saveStored(encrypt(entry))
+    suspend fun save(entry: NotificationEntry) = withContext(Dispatchers.IO) { saveStored(encrypt(entry)) }
 
     @Transaction
     open suspend fun capture(incoming: CapturedNotification, initialDecision: ((NotificationEntry) -> Decision)? = null) {
+        captureIfChanged(incoming, initialDecision)
+    }
+
+    /** Replayed snapshots must not re-encrypt history, invalidate the inbox, or reschedule analysis. */
+    @Transaction
+    open suspend fun captureIfChanged(incoming: CapturedNotification, initialDecision: ((NotificationEntry) -> Decision)? = null): Boolean {
         val previous = find(incoming.notificationKey)
+        if (previous != null && previous.packageName == incoming.packageName &&
+            previous.contentHash == incoming.contentHash && previous.appLabel == incoming.appLabel &&
+            previous.title == incoming.title && previous.body == incoming.body &&
+            previous.channelId == incoming.channelId && previous.postedAt == incoming.postedAt && previous.removedAt == null) return false
         val merged = mergeNotification(previous, incoming)
         // Give the inbox a useful local placement in the same transaction as capture. A slow
         // network request or delayed WorkManager job must not make categorizing a user's job.
@@ -50,6 +84,7 @@ abstract class NotificationDao {
             machineReason = decision.reason, machineConfidence = decision.confidence,
             analysisSource = decision.source,
         ))
+        return true
     }
 
     @Query("""UPDATE notifications SET
@@ -78,7 +113,7 @@ abstract class NotificationDao {
     @Query("UPDATE notifications SET interested = :value WHERE notificationKey = :key")
     abstract suspend fun setInterested(key: String, value: Boolean)
 
-    @Query("UPDATE notifications SET removedAt = :at WHERE notificationKey = :key")
+    @Query("UPDATE notifications SET removedAt = :at WHERE notificationKey = :key AND removedAt IS NULL")
     abstract suspend fun markRemoved(key: String, at: Long)
 
     @Query("""UPDATE notifications SET
@@ -100,7 +135,45 @@ abstract class NotificationDao {
     protected abstract suspend fun pendingStored(limit: Int, includeRetry: Boolean, onlyRetry: Boolean): List<NotificationEntry>
 
     suspend fun pending(limit: Int = 30, includeRetry: Boolean = true, onlyRetry: Boolean = false): List<NotificationEntry> =
-        pendingStored(limit, includeRetry, onlyRetry).map(::decrypt)
+        withContext(Dispatchers.IO) { pendingStored(limit, includeRetry, onlyRetry).map(::decrypt) }
+
+    @Query("""SELECT * FROM notifications WHERE packageName IN (:packages) AND handledAt IS NULL
+        ORDER BY postedAt DESC LIMIT :limit""")
+    protected abstract suspend fun assistantCandidatesStored(packages: List<String>, limit: Int): List<NotificationEntry>
+
+    suspend fun assistantCandidates(packages: List<String>, limit: Int = 80): List<NotificationEntry> =
+        withContext(Dispatchers.IO) { assistantCandidatesStored(packages, limit.coerceIn(1, 200)).map(::decrypt) }
+
+    @Query("""UPDATE notifications SET userLabel = :label, previousLabel = :previousLabel,
+        labelSource = :labelSource, manualVersion = :manualVersion, analysisStatus = :status, handledAt = :handledAt
+        WHERE notificationKey = :key""")
+    protected abstract suspend fun writeAssistantState(
+        key: String, label: UserLabel, previousLabel: UserLabel, labelSource: String,
+        manualVersion: Int, status: String, handledAt: Long?,
+    ): Int
+
+    /** All comparisons and writes share one transaction; stale proposals and stale undo are skipped. */
+    @Transaction
+    open suspend fun applyAssistantEdits(edits: List<AssistantEntryEdit>): Int = applyAssistantEditsReturning(edits).size
+
+    @Transaction
+    open suspend fun applyAssistantEditsReturning(edits: List<AssistantEntryEdit>, beforeWrite: suspend () -> Unit = {}): List<AssistantEntryEdit> {
+        val changed = mutableListOf<AssistantEntryEdit>()
+        for ((before, after) in edits) {
+            beforeWrite()
+            if (before.notificationKey != after.notificationKey) continue
+            val current = find(before.notificationKey) ?: continue
+            if (current != before) continue
+            val updated = current.copy(userLabel = after.userLabel, previousLabel = after.previousLabel,
+                labelSource = after.labelSource, manualVersion = after.manualVersion,
+                analysisStatus = after.analysisStatus, handledAt = after.handledAt)
+            if (updated != current && writeAssistantState(updated.notificationKey, updated.userLabel, updated.previousLabel,
+                updated.labelSource, updated.manualVersion, updated.analysisStatus, updated.handledAt) == 1)
+                changed += AssistantEntryEdit(current, updated)
+        }
+        beforeWrite()
+        return changed
+    }
 
     @Query("""SELECT COUNT(*) FROM notifications WHERE analysisStatus IN ('pending', 'retry', 'retry2')
         AND labelSource != 'manual' AND handledAt IS NULL""")
@@ -136,8 +209,10 @@ abstract class NotificationDao {
     suspend fun finishAnalysis(
         key: String, version: Int, hash: String, bucket: String, kind: String,
         reason: String, confidence: Double, source: String, status: String,
-    ): Int = finishStoredAnalysis(key, version, hash, bucket, kind,
-        cipher.encrypt(reason, aad(key, "machineReason")), confidence, source, status)
+    ): Int = withContext(Dispatchers.IO) {
+        finishStoredAnalysis(key, version, hash, bucket, kind,
+            cipher.encrypt(reason, aad(key, "machineReason")), confidence, source, status)
+    }
 
     @Query("""SELECT * FROM notifications
         WHERE packageName IN (:packages) AND labelSource != 'manual' AND handledAt IS NULL""")
@@ -145,18 +220,39 @@ abstract class NotificationDao {
 
     @Transaction
     open suspend fun requeueForPackages(packages: List<String>) {
-        storedForPackages(packages).forEach { stored ->
-            save(decrypt(stored).copy(machineBucket = "REVIEW", machineKind = "unknown",
-                machineReason = "偏好已更新，等待重新整理", machineConfidence = 0.0,
-                analysisSource = "", analysisStatus = "pending"))
+        withContext(Dispatchers.IO) {
+            storedForPackages(packages).forEach { stored ->
+                if (stored.storageEncryptionVersion != 1) {
+                    save(decrypt(stored).copy(machineBucket = "REVIEW", machineKind = "unknown",
+                        machineReason = "偏好已更新，等待重新整理", machineConfidence = 0.0,
+                        analysisSource = "", analysisStatus = "pending"))
+                    return@forEach
+                }
+                // Reasons are authenticated per key, so retain each original content ciphertext.
+                val reason = cipher.encrypt("偏好已更新，等待重新整理", aad(stored.notificationKey, "machineReason"))
+                requeueStored(stored.notificationKey, reason, true)
+            }
         }
     }
 
+    @Query("""UPDATE notifications SET machineBucket = 'REVIEW', machineReason = :reason, analysisStatus = 'pending',
+        machineKind = CASE WHEN :resetDecision THEN 'unknown' ELSE machineKind END,
+        machineConfidence = CASE WHEN :resetDecision THEN 0.0 ELSE machineConfidence END,
+        analysisSource = CASE WHEN :resetDecision THEN '' ELSE analysisSource END
+        WHERE notificationKey = :key AND labelSource != 'manual' AND handledAt IS NULL
+        AND storageEncryptionVersion = 1""")
+    protected abstract suspend fun requeueStored(key: String, reason: String, resetDecision: Boolean): Int
+
     @Transaction
     open suspend fun requeueOne(key: String) {
-        val current = find(key) ?: return
-        if (current.labelSource != "manual" && current.handledAt == null) save(current.copy(machineBucket = "REVIEW",
-            machineReason = "关注偏好已更新，等待整理", analysisStatus = "pending"))
+        withContext(Dispatchers.IO) {
+            val current = findStored(key) ?: return@withContext
+            if (current.labelSource != "manual" && current.handledAt == null) {
+                if (current.storageEncryptionVersion == 1) {
+                    requeueStored(key, cipher.encrypt("关注偏好已更新，等待整理", aad(key, "machineReason")), false)
+                } else save(decrypt(current).copy(machineBucket = "REVIEW", machineReason = "关注偏好已更新，等待整理", analysisStatus = "pending"))
+            }
+        }
     }
 
     @Query("SELECT * FROM notifications WHERE storageEncryptionVersion = 0 LIMIT 100")
@@ -215,6 +311,26 @@ abstract class NotificationDao {
 
     private fun aad(key: String, field: String) = "qingxu.notification.v1:$key:$field"
 
+    /** Restrict surface reads to relevant rows; summary metadata needs no decryption at all. */
+    @Query("""SELECT * FROM notifications WHERE packageName IN (:packages) AND handledAt IS NULL
+        AND (machineBucket = 'NOW' OR userLabel IN ('IMPORTANT_URGENT', 'URGENT'))""")
+    protected abstract suspend fun summaryCandidatesStored(packages: List<String>): List<NotificationEntry>
+
+    suspend fun prioritySummaryCount(packages: List<String>, now: Long = System.currentTimeMillis()): Int =
+        withContext(Dispatchers.IO) {
+            summaryCandidatesStored(packages).count { it.displayBucket(now) == DecisionBucket.NOW }
+        }
+
+    @Query("""SELECT * FROM notifications WHERE packageName IN (:packages) AND handledAt IS NULL
+        AND removedAt IS NULL AND labelSource != 'manual' AND interested = 0 AND analysisStatus = 'done'
+        AND analysisSource IN ('local', 'ai', 'jev') AND machineKind = 'marketing' AND machineBucket = 'HIDDEN'
+        AND machineConfidence >= 0.95""")
+    protected abstract suspend fun promotionCandidatesStored(packages: List<String>): List<NotificationEntry>
+
+    suspend fun promotionCandidates(packages: List<String>): List<NotificationEntry> = withContext(Dispatchers.IO) {
+        promotionCandidatesStored(packages).map(::decrypt)
+    }
+
     private fun encrypt(entry: NotificationEntry): NotificationEntry = entry.copy(
         appLabel = cipher.encrypt(entry.appLabel, aad(entry.notificationKey, "appLabel")),
         title = cipher.encrypt(entry.title, aad(entry.notificationKey, "title")),
@@ -232,5 +348,18 @@ abstract class NotificationDao {
             machineReason = cipher.decrypt(entry.machineReason, aad(entry.notificationKey, "machineReason")),
         )
         else -> throw NotificationEncryptionException()
+    }
+
+    private fun decrypt(entry: NotificationEntry, cached: Pair<NotificationEntry, NotificationEntry>?): NotificationEntry {
+        if (entry.storageEncryptionVersion != 1 || cached?.first?.storageEncryptionVersion != 1) return decrypt(entry)
+        val (stored, clear) = cached
+        fun field(name: String, value: String, old: String, plaintext: String): String =
+            if (value == old) plaintext else cipher.decrypt(value, aad(entry.notificationKey, name))
+        return entry.copy(
+            appLabel = field("appLabel", entry.appLabel, stored.appLabel, clear.appLabel),
+            title = field("title", entry.title, stored.title, clear.title),
+            body = field("body", entry.body, stored.body, clear.body),
+            machineReason = field("machineReason", entry.machineReason, stored.machineReason, clear.machineReason),
+        )
     }
 }

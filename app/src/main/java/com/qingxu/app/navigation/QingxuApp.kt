@@ -18,6 +18,7 @@ import com.qingxu.app.core.ui.BrandFace
 import com.qingxu.app.feature.QingxuViewModel
 import com.qingxu.app.feature.filtered.FilteredScreen
 import com.qingxu.app.feature.inbox.InboxScreen
+import com.qingxu.app.feature.assistant.AssistantScreen
 import com.qingxu.app.feature.settings.SettingsScreen
 import com.qingxu.app.feature.settings.SourceSettingsScreen
 import com.qingxu.app.feature.settings.AiSettingsScreen
@@ -36,6 +37,8 @@ fun QingxuApp(viewModel: QingxuViewModel, onUnlock: () -> Unit = {}, onPermissio
     val ai by viewModel.aiSettings.collectAsStateWithLifecycle()
     val aiStatus by viewModel.aiStatus.collectAsStateWithLifecycle()
     val connectionTest by viewModel.connectionTest.collectAsStateWithLifecycle()
+    val processingActivity by viewModel.processingActivity.collectAsStateWithLifecycle()
+    val assistant by viewModel.assistant.state.collectAsStateWithLifecycle()
     val rules by viewModel.rules.collectAsStateWithLifecycle()
     val priorityRules by viewModel.prioritySenders.collectAsStateWithLifecycle()
     val surfaceSettings by viewModel.surfaceSettings.collectAsStateWithLifecycle()
@@ -56,14 +59,15 @@ fun QingxuApp(viewModel: QingxuViewModel, onUnlock: () -> Unit = {}, onPermissio
     LaunchedEffect(page, concealed) {
         if (page != 3 || concealed) viewModel.connectionDraftChanged()
     }
-    BackHandler(page >= 3) { page = 2 }
+    BackHandler(page >= 3) { page = if (page == 6) 0 else 2 }
     val tutorial: (@Composable () -> Unit)? = if (guiding && guideStep >= 2) {
         { OnboardingExample(onboarding, viewModel::classifyExample, viewModel::starExample, viewModel::restoreExample, onDemo = viewModel::demoExample) }
     } else null
     Scaffold(
         topBar = {
-            TopAppBar(title = { Text(when(page) { 0 -> "轻序"; 3 -> "高级设置"; 4 -> "隐私保护"; 5 -> "整理哪些应用"; else -> labels[page] }, style = MaterialTheme.typography.titleLarge) },
-                navigationIcon = { if (page >= 3) IconButton(onClick = { page = 2 }) { Icon(Icons.AutoMirrored.Outlined.ArrowBack, contentDescription = "返回设置") }
+            TopAppBar(title = { Text(when(page) { 0 -> "轻序"; 3 -> "高级设置"; 4 -> "隐私保护"; 5 -> "整理哪些应用"; 6 -> "消息助手"; else -> labels[page] }, style = MaterialTheme.typography.titleLarge) },
+                navigationIcon = { if (page >= 3) IconButton(onClick = { page = if (page == 6) 0 else 2 }) { Icon(Icons.AutoMirrored.Outlined.ArrowBack,
+                    contentDescription = if (page == 6) "返回收件箱" else "返回设置") }
                     else BrandFace(Modifier.padding(start = 20.dp, end = 10.dp).size(36.dp)) },
                 actions = { if (privacy.hideContent) TextButton(onClick = { if (unlocked) viewModel.lockContent() else onUnlock() }) {
                     Text(if (unlocked) "遮住内容" else "解锁查看")
@@ -77,7 +81,7 @@ fun QingxuApp(viewModel: QingxuViewModel, onUnlock: () -> Unit = {}, onPermissio
                         onFinish = { viewModel.completeOnboarding(); page = 0 })
                     NavigationBar(containerColor = MaterialTheme.colorScheme.background, tonalElevation = 0.dp) {
                         labels.forEachIndexed { index, label ->
-                            NavigationBarItem(selected = (if (page >= 2) 2 else page) == index, onClick = { page = index; if (index == 2) viewModel.refresh() },
+                            NavigationBarItem(selected = (if (page == 6) 0 else if (page >= 2) 2 else page) == index, onClick = { page = index; if (index == 2) viewModel.refresh() },
                                 icon = { Icon(icons[index], contentDescription = null,
                                     modifier = if (guiding && index == targetTab && page != targetPage && page != index)
                                         Modifier.border(2.dp, MaterialTheme.colorScheme.primary, RoundedCornerShape(10.dp)).padding(5.dp)
@@ -97,7 +101,9 @@ fun QingxuApp(viewModel: QingxuViewModel, onUnlock: () -> Unit = {}, onPermissio
                     onOpen = viewModel::openOriginal, tutorial = if (targetPage == 0) tutorial else null,
                     onHideSimilar = viewModel::hideSimilar, concealContent = concealed, onUnlock = onUnlock,
                     onReconnect = viewModel::reconnectNotifications, onHandled = viewModel::setHandled,
-                    onPrioritizeSender = viewModel::prioritizeSender, onTestNotification = { onNotificationPermission(false, viewModel::testNotification) })
+                    onPrioritizeSender = viewModel::prioritizeSender, onTestNotification = { onNotificationPermission(false, viewModel::testNotification) },
+                    aiSettings = ai, privacySettings = privacy, processingActivity = processingActivity,
+                    onAssistant = { page = 6 }, onAiSettings = { page = 3 })
                 1 -> FilteredScreen(state.entries, viewModel::restore, viewModel::toggleInterest,
                     tutorial = if (targetPage == 1) tutorial else null, onHideSimilar = viewModel::hideSimilar,
                     concealContent = concealed, onUnlock = onUnlock, onOpen = viewModel::openOriginal,
@@ -122,6 +128,10 @@ fun QingxuApp(viewModel: QingxuViewModel, onUnlock: () -> Unit = {}, onPermissio
                 }, guideStep = if (guiding) guideStep else null, requiresUnlock = concealed, onUnlock = onUnlock,
                     onReconnect = viewModel::reconnectNotifications, privacySettings = privacy, aiSettings = ai,
                     onTestNotification = { onNotificationPermission(false, viewModel::testNotification) })
+                6 -> AssistantScreen(assistant.copy(concealed = concealed), viewModel.assistant::updateDraft,
+                    viewModel.assistant::send, viewModel.assistant::apply, viewModel.assistant::dismiss,
+                    viewModel.assistant::undo, onSettings = { page = 3 }, onUnlock = onUnlock,
+                    onClear = viewModel.assistant::clear)
             }
         }
     }

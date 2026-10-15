@@ -46,6 +46,7 @@ import com.qingxu.app.core.decision.effectiveBucket
 import com.qingxu.app.core.decision.isLongTermHideEligible
 import com.qingxu.app.notification.SurfaceSettings
 import kotlinx.coroutines.flow.asStateFlow
+import com.qingxu.app.feature.assistant.AssistantCoordinator
 
 data class SourceApp(val packageName: String, val label: String)
 
@@ -79,6 +80,8 @@ class QingxuViewModel internal constructor(application: Application, private val
     val aiSettings = container.ai.state
     val privacySettings = container.privacy.state
     val contentUnlocked = container.contentSession.unlocked
+    val assistant = AssistantCoordinator(application, container, viewModelScope)
+    val processingActivity = container.processor.activity
     private val mutablePrivacyStatus = MutableStateFlow("")
     val privacyStatus = mutablePrivacyStatus.asStateFlow()
     private val mutableAiStatus = MutableStateFlow("")
@@ -123,17 +126,24 @@ class QingxuViewModel internal constructor(application: Application, private val
     }
 
     private var refreshing = false
+    private var appsLoadedAt = 0L
+    private var snapshotRequestedAt = 0L
 
     fun refresh() {
-        AnalysisScheduler.enqueue(getApplication())
         access.value = NotificationAccess.granted(getApplication())
-        if (access.value) QingxuNotificationListener.refreshActive()
+        val elapsed = android.os.SystemClock.elapsedRealtime()
+        if (elapsed - snapshotRequestedAt >= 5_000 || snapshotRequestedAt == 0L) {
+            snapshotRequestedAt = elapsed
+            AnalysisScheduler.enqueue(getApplication())
+            if (access.value) QingxuNotificationListener.refreshActive()
+        }
         NotificationConnectionRecovery.request(getApplication())
-        if (refreshing) return
+        if (refreshing || (apps.value.isNotEmpty() && elapsed - appsLoadedAt < 60_000)) return
         refreshing = true
         viewModelScope.launch {
             try {
                 apps.value = withContext(Dispatchers.IO) { loadApps() }
+                appsLoadedAt = android.os.SystemClock.elapsedRealtime()
             } catch (error: CancellationException) {
                 throw error
             } catch (_: Exception) {
@@ -413,7 +423,7 @@ class QingxuViewModel internal constructor(application: Application, private val
         }
     }
 
-    fun lockContent() = container.contentSession.lock()
+    fun lockContent() { container.contentSession.lock(); assistant.clear() }
     fun unlockContent() { container.contentSession.unlock() }
     fun expireContentSession() { container.contentSession.isUnlocked() }
     private fun requirePrivateAccess(): Boolean {

@@ -63,6 +63,7 @@ class NotificationProcessorTest {
         assertEquals(DecisionBucket.NOW, dao.find("refund")!!.effectiveBucket())
         assertEquals(DecisionBucket.LATER, dao.find("ambiguous")!!.effectiveBucket())
         assertEquals(0, calls)
+        assertEquals(ProcessingActivity(), processor.activity.value)
     }
     @Test fun interestAndStarKeepPromotionsVisibleAndRestoreOverridesAutomation() = runBlocking {
         preferences.save("", "", null, false, emptySet(), "摄影")
@@ -164,6 +165,8 @@ class NotificationProcessorTest {
 
     @Test fun fakeCloudSuccessUsesConsistentSettingsAndClassifiesThePendingEntry() = runBlocking {
         configureFakeCloud { settings, key, entry ->
+            assertTrue(processor.activity.value.running)
+            assertEquals(settings.revision, processor.activity.value.settingsRevision)
             assertEquals("https://provider.invalid/v1/chat/completions", settings.endpoint)
             assertEquals("fake-model", settings.model)
             assertEquals("fake-key-never-sent", key)
@@ -177,6 +180,9 @@ class NotificationProcessorTest {
         assertEquals("done", result.analysisStatus)
         assertEquals("ai", result.analysisSource)
         assertEquals(1, calls)
+        assertFalse(processor.activity.value.running)
+        assertEquals(ProcessingOutcome.SUCCEEDED, processor.activity.value.lastOutcome)
+        assertNotNull(processor.activity.value.lastCompletedAt)
     }
 
     @Test fun cloudFailuresRetryTwiceThenRemainVisibleWithoutFurtherAutomaticRequests() = runBlocking {
@@ -191,6 +197,8 @@ class NotificationProcessorTest {
             assertEquals("local", result.analysisSource)
             assertFalse(result.machineReason.contains("private-provider-response-not-for-users"))
             assertEquals(attempt + 1, calls)
+            assertFalse(processor.activity.value.running)
+            assertEquals(ProcessingOutcome.FAILED, processor.activity.value.lastOutcome)
         }
         assertEquals(0, dao.pendingCount())
         assertFalse(processor.processBatch(0))
@@ -208,6 +216,20 @@ class NotificationProcessorTest {
         assertEquals(result.contentVersion, result.manualVersion)
         assertEquals("unknown", result.machineKind)
         assertEquals(1, calls)
+        assertFalse(processor.activity.value.running)
+        assertEquals(ProcessingOutcome.DISCARDED, processor.activity.value.lastOutcome)
+    }
+
+    @Test fun cancelledCloudRequestStopsActivityWithoutClaimingSuccessOrFailure() = runBlocking {
+        configureFakeCloud { _, _, _ -> throw kotlinx.coroutines.CancellationException("test cancellation") }
+        capture("cancelled-request", "订单有新的进展，请查看详情")
+        try {
+            processor.processBatch(0)
+            fail("Expected cancellation")
+        } catch (_: kotlinx.coroutines.CancellationException) { }
+        assertFalse(processor.activity.value.running)
+        assertEquals(ProcessingOutcome.DISCARDED, processor.activity.value.lastOutcome)
+        assertEquals("pending", dao.find("cancelled-request")!!.analysisStatus)
     }
 
     @Test fun completionDuringCloudRequestCannotBeChangedByItsLateResult() = runBlocking {

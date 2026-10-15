@@ -76,6 +76,22 @@ class NotificationRepositoryDeletionTest {
         }
     }
 
+    @Test fun replayedSnapshotsRemainReceivedButDoNotRescheduleAnalysis() = runBlocking {
+        var persisted = 0
+        var captured = 0
+        val repository = NotificationRepository(dao, sources,
+            onPersisted = { persisted++ }, onCaptured = { captured++ })
+        repository.capture(old)
+        repository.capture(old.copy(capturedAt = 900L))
+        assertEquals(2, persisted)
+        assertEquals(1, captured)
+        assertEquals(500L, dao.find("old")!!.updatedAt)
+        repository.capture(old.copy(body = "新正文", contentHash = "new-hash", capturedAt = 901L))
+        assertEquals(3, persisted)
+        assertEquals(2, captured)
+        assertEquals("新正文", dao.find("old")!!.body)
+    }
+
     @Test fun waitingCaptureReadsDeletionCutoffOnlyAfterDeletionReleasesSharedGate() = runBlocking {
         withTimeout(10_000) {
             dao.capture(old)

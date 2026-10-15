@@ -25,12 +25,18 @@ import com.qingxu.app.core.decision.isConfidentlyOrganized
 import com.qingxu.app.core.ui.BrandFace
 import com.qingxu.app.core.ui.NotificationCard
 import com.qingxu.app.core.ui.QuietState
+import com.qingxu.app.core.ai.AiProvider
+import com.qingxu.app.core.ai.AiSettings
+import com.qingxu.app.core.privacy.PrivacySettings
+import com.qingxu.app.core.processing.ProcessingActivity
+import com.qingxu.app.core.processing.ProcessingOutcome
 import com.qingxu.app.data.local.NotificationEntry
 import com.qingxu.app.data.local.UserLabel
 import com.qingxu.app.feature.QingxuUiState
 import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
+import kotlinx.coroutines.delay
 
 @Composable
 fun InboxScreen(
@@ -47,33 +53,53 @@ fun InboxScreen(
     onHandled: (NotificationEntry, Boolean) -> Unit = { _, _ -> },
     onPrioritizeSender: (NotificationEntry) -> Unit = {},
     onTestNotification: () -> Unit = {},
+    aiSettings: AiSettings = AiSettings(),
+    privacySettings: PrivacySettings = PrivacySettings(),
+    processingActivity: ProcessingActivity = ProcessingActivity(),
+    onAssistant: () -> Unit = {},
+    onAiSettings: () -> Unit = {},
 ) {
     var filter by rememberSaveable { mutableStateOf("pending") }
     var searchExpanded by rememberSaveable { mutableStateOf(false) }
     var query by rememberSaveable { mutableStateOf("") }
     var showOtherHelp by rememberSaveable { mutableStateOf(false) }
-    val inbox = state.entries.filter { it.handledAt == null && it.effectiveBucket() != DecisionBucket.HIDDEN }
-    val handled = state.entries.filter { it.handledAt != null }
-    val filtered = when (filter) {
-        "interested" -> inbox.filter { it.interested }
-        "handled" -> handled
-        else -> inbox
+    val displayTime by produceState(System.currentTimeMillis()) {
+        while (true) { delay(60_000); value = System.currentTimeMillis() }
     }
-    val visible = if (concealContent || query.isBlank()) filtered else filtered.filter {
-        listOf(it.appLabel, it.title, it.body).any { text -> text.contains(query.trim(), ignoreCase = true) }
+    val inbox = remember(state.entries) { state.entries.filter { it.handledAt == null && it.effectiveBucket() != DecisionBucket.HIDDEN } }
+    val handled = remember(state.entries) { state.entries.filter { it.handledAt != null } }
+    val filtered = remember(filter, inbox, handled) {
+        when (filter) { "interested" -> inbox.filter { it.interested }; "handled" -> handled; else -> inbox }
     }
-    val groups = visible.groupBy { it.displayBucket() }
-    val nowCount = inbox.count { it.displayBucket() == DecisionBucket.NOW }
-    val organized = state.entries.filter { it.isConfidentlyOrganized() }
+    val visible = remember(filtered, query, concealContent) {
+        if (concealContent || query.isBlank()) filtered else filtered.filter {
+            listOf(it.appLabel, it.title, it.body).any { text -> text.contains(query.trim(), ignoreCase = true) }
+        }
+    }
+    val groups = remember(visible, displayTime) {
+        visible.groupBy { it.displayBucket(displayTime) }.mapValues { (_, entries) -> entries.sortedByDescending { it.postedAt } }
+    }
+    val nowCount = remember(inbox, displayTime) { inbox.count { it.displayBucket(displayTime) == DecisionBucket.NOW } }
+    val organized = remember(state.entries) { state.entries.filter { it.isConfidentlyOrganized() } }
+    val organizedHiddenCount = remember(organized) { organized.count { it.effectiveBucket() == DecisionBucket.HIDDEN } }
+    val interestedCount = remember(inbox) { inbox.count { it.interested } }
+    val sortedHandled = remember(visible) { visible.sortedByDescending { it.handledAt } }
+    val aiOrganizedCount = remember(state.entries, aiSettings.provider) { state.entries.count {
+        it.analysisStatus == "done" && it.analysisSource == (if (aiSettings.provider == AiProvider.JEV) "jev" else "ai") && it.labelSource != "manual"
+    } }
+    val privacyWaiting = remember(state.entries, aiSettings.allowedPackages, state.selectedPackages, privacySettings.localOnlyPackages) {
+        val allowed = aiSettings.allowedPackages.intersect(state.selectedPackages) - privacySettings.localOnlyPackages
+        state.entries.any { it.analysisStatus == "privacy_waiting" && it.packageName in allowed }
+    }
     LazyColumn(modifier = Modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(8.dp),
         contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp)) {
         if (state.entries.isNotEmpty()) item(key = "focus-header") {
             Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                AutomaticFocusHeader(nowCount, organized.size, organized.count { it.effectiveBucket() == DecisionBucket.HIDDEN })
+                AutomaticFocusHeader(nowCount, organized.size, organizedHiddenCount)
                 Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                     Row(Modifier.weight(1f).horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                         FilterChip(selected = filter == "pending", onClick = { filter = "pending" }, label = { Text("待看 ${inbox.size}") })
-                        FilterChip(selected = filter == "interested", onClick = { filter = "interested" }, label = { Text("关注 ${inbox.count { it.interested }}") })
+                        FilterChip(selected = filter == "interested", onClick = { filter = "interested" }, label = { Text("关注 $interestedCount") })
                         FilterChip(selected = filter == "handled", onClick = { filter = "handled" }, label = { Text("已处理 ${handled.size}") })
                     }
                     if (!concealContent) IconButton(onClick = { searchExpanded = !searchExpanded; if (!searchExpanded) query = "" }) {
@@ -86,6 +112,10 @@ fun InboxScreen(
                         placeholder = { Text("搜索消息或应用") }, singleLine = true, shape = RoundedCornerShape(16.dp))
                 }
             }
+        }
+        item(key = "assistant-status") {
+            AutomaticServiceStatus(aiSettings, privacySettings, state.selectedPackages, processingActivity,
+                aiOrganizedCount, privacyWaiting, concealContent, onAssistant, onAiSettings, onUnlock)
         }
         if (tutorial != null) item(key = "tutorial") { tutorial() }
         if ((!state.permissionGranted || state.selectedPackages.isEmpty()) && inbox.isNotEmpty()) item(key = "setup") {
@@ -121,13 +151,13 @@ fun InboxScreen(
                 onAction = onSettings)
         }
         if (filter == "handled") {
-            items(visible.sortedByDescending { it.handledAt }, key = { it.notificationKey }) { entry ->
+            items(sortedHandled, key = { it.notificationKey }) { entry ->
                 Box(Modifier.animateItem()) {
                     InboxCard(entry, onClassify, onInterest, onOpen, onHideSimilar, concealContent, onUnlock, onHandled, onPrioritizeSender)
                 }
             }
         } else listOf(DecisionBucket.NOW, DecisionBucket.LATER, DecisionBucket.REVIEW).forEach { bucket ->
-            val entries = groups[bucket].orEmpty().sortedByDescending { it.postedAt }
+            val entries = groups[bucket].orEmpty()
             if (entries.isNotEmpty()) {
                 item(key = "group:${bucket.name}") {
                     Column {
@@ -150,6 +180,57 @@ fun InboxScreen(
                 }
             }
         }
+    }
+}
+
+@Composable
+private fun AutomaticServiceStatus(ai: AiSettings, privacy: PrivacySettings, selected: Set<String>,
+    activity: ProcessingActivity, organizedCount: Int, privacyWaiting: Boolean, concealed: Boolean,
+    onAssistant: () -> Unit, onSettings: () -> Unit, onUnlock: () -> Unit) {
+    val title = remember(ai, privacy, selected, activity, organizedCount, privacyWaiting, concealed) {
+        automaticServiceStatus(ai, privacy, selected, activity, organizedCount, privacyWaiting, concealed)
+    }
+    Surface(Modifier.fillMaxWidth(), color = MaterialTheme.colorScheme.surfaceContainerLow,
+        shape = RoundedCornerShape(18.dp)) {
+        Column(Modifier.padding(horizontal = 14.dp, vertical = 8.dp)) {
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                if (!concealed && activity.running && activity.settingsRevision == ai.revision) {
+                    CircularProgressIndicator(Modifier.size(14.dp), strokeWidth = 2.dp)
+                }
+                Text(title, Modifier.weight(1f), style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                TextButton(onClick = onAssistant, contentPadding = PaddingValues(horizontal = 0.dp)) {
+                    Icon(Icons.Outlined.ChatBubbleOutline, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text("和小耳聊聊")
+                }
+                Spacer(Modifier.weight(1f))
+                if (concealed) TextButton(onClick = onUnlock) { Text("解锁") }
+                else TextButton(onClick = onSettings) { Text("服务设置") }
+            }
+        }
+    }
+}
+
+/** Display only observed cloud work; enabling a switch alone is never reported as AI processing. */
+internal fun automaticServiceStatus(ai: AiSettings, privacy: PrivacySettings, selected: Set<String>,
+    activity: ProcessingActivity, organizedCount: Int, privacyWaiting: Boolean, concealed: Boolean): String {
+    val service = if (ai.provider == AiProvider.JEV) "Jev 决策服务" else "AI"
+    val allowed = ai.allowedPackages.intersect(selected) - privacy.localOnlyPackages
+    val current = activity.settingsRevision == ai.revision && activity.provider == ai.provider
+    return when {
+        concealed -> "内容已遮住 · 解锁后查看整理状态"
+        !ai.enabled -> "本机规则运行中 · $service 未启用"
+        ai.endpoint.isBlank() || ai.model.isBlank() || !ai.hasKey -> "$service 尚未配置完整"
+        allowed.isEmpty() -> "$service 待授权 · 尚无可分析来源"
+        current && activity.running -> "$service 正在分析消息…"
+        privacyWaiting && privacy.blockCloudWhenLocked -> "$service 隐私暂停 · 有消息等待解锁后分析"
+        current && activity.lastOutcome == ProcessingOutcome.FAILED -> "$service 连接失败 · 已保留本机整理结果"
+        organizedCount > 0 -> "$service 已整理 $organizedCount 条 · 其余先按本机规则"
+        else -> "$service 已开启 · 等待需要进一步判断的消息"
     }
 }
 

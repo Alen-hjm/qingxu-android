@@ -28,8 +28,9 @@ import com.qingxu.app.feature.SourceApp
 
 @Composable
 fun PrivacySettingsScreen(settings: PrivacySettings, apps: List<SourceApp>, selected: Set<String>, status: String,
-    onSave: (Boolean, Boolean, Set<String>, Int) -> Unit, onDeleteAll: () -> Unit, cloudEnabled: Boolean = false) {
+    onSave: (Boolean, Boolean, Set<String>, Int, Boolean) -> Unit, onDeleteAll: () -> Unit, cloudEnabled: Boolean = false) {
     var hideContent by rememberSaveable(settings.revision) { mutableStateOf(settings.hideContent) }
+    var preventScreenshots by rememberSaveable(settings.revision) { mutableStateOf(settings.preventScreenshots) }
     var blockWhenLocked by rememberSaveable(settings.revision) { mutableStateOf(settings.blockCloudWhenLocked) }
     var localOnly by remember(settings.revision) { mutableStateOf(settings.localOnlyPackages) }
     var retentionDays by rememberSaveable(settings.revision) { mutableIntStateOf(settings.retentionDays) }
@@ -38,7 +39,8 @@ fun PrivacySettingsScreen(settings: PrivacySettings, apps: List<SourceApp>, sele
     var showDetails by rememberSaveable { mutableStateOf(false) }
     var showCloudPrivacy by rememberSaveable { mutableStateOf(false) }
     val dirty = hideContent != settings.hideContent || blockWhenLocked != settings.blockCloudWhenLocked ||
-        localOnly != settings.localOnlyPackages || retentionDays != settings.retentionDays
+        localOnly != settings.localOnlyPackages || retentionDays != settings.retentionDays ||
+        preventScreenshots != settings.preventScreenshots
     val retentionOptions = listOf(7 to "7 天", 30 to "30 天", 0 to "不自动清理")
 
     if (confirmDeletion) AlertDialog(
@@ -85,16 +87,23 @@ fun PrivacySettingsScreen(settings: PrivacySettings, apps: List<SourceApp>, sele
                         Text("隐私保护", style = MaterialTheme.typography.headlineSmall)
                         Text(when {
                             dirty -> "有修改待保存"
-                            settings.hideContent -> "消息内容已保护"
-                            else -> "使用自定义保护"
+                            settings.hideContent -> "应用锁已开启"
+                            settings.preventScreenshots -> "截图保护已开启"
+                            else -> "按需开启，日常直接查看"
                         }, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                 }
             }
             item {
                 Surface(shape = RoundedCornerShape(20.dp), color = MaterialTheme.colorScheme.surface) {
-                    SettingSwitch("解锁后查看消息", "保护通知正文", "用手机系统锁验证身份。",
+                    SettingSwitch("应用锁", "应用锁", "可选。优先用指纹等生物识别，无可用方式时使用系统锁。",
                         hideContent, { hideContent = it })
+                }
+            }
+            item {
+                Surface(shape = RoundedCornerShape(20.dp), color = MaterialTheme.colorScheme.surface) {
+                    SettingSwitch("防止截图与录屏", "防止截图与录屏", "独立控制截图、录屏和最近任务预览，不影响应用锁或云端上传。",
+                        preventScreenshots, { preventScreenshots = it })
                 }
             }
             item {
@@ -171,7 +180,8 @@ fun PrivacySettingsScreen(settings: PrivacySettings, apps: List<SourceApp>, sele
                     AnimatedVisibility(showDetails) {
                         Column(Modifier.testTag("privacy-details").padding(horizontal = 12.dp, vertical = 12.dp),
                             verticalArrangement = Arrangement.spacedBy(16.dp)) {
-                            PrivacyDetail("查看保护", "关闭保护也需先验证身份。未设置系统锁时，请先到手机设置中开启。")
+                            PrivacyDetail("应用锁", "新安装默认关闭。开启时需验证身份；持续在前台使用不会超时，短暂切换应用可在 60 秒内返回，锁屏立即锁定。没有可用的生物识别时用系统锁；未设置系统锁需先设置。")
+                            PrivacyDetail("截图与录屏", "新安装默认关闭，与应用锁分别保存。开启后请求系统限制截图、录屏和最近任务预览，实际效果取决于设备。")
                             PrivacyDetail("锁屏与云端", "锁屏限制新的分析，已发出的请求无法撤回。Jev 等服务在云端运行。")
                             PrivacyDetail("本机整理", "仅本机来源使用规则，尚未接入端侧 AI。关闭仅本机限制，不会自动允许上传。")
                             PrivacyDetail("本机保存", "通知正文加密保存；应用包名、时间和分类等元数据仍以明文保存。")
@@ -188,7 +198,7 @@ fun PrivacySettingsScreen(settings: PrivacySettings, apps: List<SourceApp>, sele
                 verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 if (status.isNotBlank()) Text(status, color = MaterialTheme.colorScheme.primary,
                     style = MaterialTheme.typography.bodyMedium)
-                Button(onClick = { onSave(hideContent, blockWhenLocked, localOnly, retentionDays) },
+                Button(onClick = { onSave(hideContent, blockWhenLocked, localOnly, retentionDays, preventScreenshots) },
                     enabled = dirty, modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp)) { Text("保存设置") }
             }
         }

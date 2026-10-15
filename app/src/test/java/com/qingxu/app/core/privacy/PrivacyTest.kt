@@ -35,11 +35,12 @@ class PrivacyTest {
         assertEquals("", prepared.packageName)
         assertEquals("cloud-input", prepared.notificationKey)
     }
-    @Test fun preferencesDefaultToPrivateAndPersistExplicitChanges() {
+    @Test fun preferencesDefaultToDirectViewingAndScreenshotsWithCloudPrivacyPreserved() {
         val context = ApplicationProvider.getApplicationContext<Context>()
         context.getSharedPreferences("privacy", Context.MODE_PRIVATE).edit().clear().commit()
         val preferences = PrivacyPreferences(context)
-        assertTrue(preferences.state.value.hideContent)
+        assertFalse(preferences.state.value.hideContent)
+        assertFalse(preferences.state.value.preventScreenshots)
         assertTrue(preferences.state.value.blockCloudWhenLocked)
         assertTrue("com.tencent.mm" in preferences.state.value.localOnlyPackages)
         assertEquals(0, preferences.state.value.retentionDays)
@@ -50,17 +51,107 @@ class PrivacyTest {
         assertEquals(setOf("shop"), reopened.localOnlyPackages)
         assertEquals(7, reopened.retentionDays)
         assertEquals(100L, reopened.deletedBefore)
+        assertTrue(reopened.hideContent)
     }
-    @Test fun viewingSessionExpiresAndDoesNotSurviveNewInstance() {
+
+    @Test fun storedLockChoiceSurvivesUpgradeAndScreenshotPreferenceIsIndependent() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val stored = context.getSharedPreferences("privacy", Context.MODE_PRIVATE)
+        listOf(true, false).forEach { enabled ->
+            stored.edit().clear().putBoolean("hide_content", enabled).commit()
+            val preferences = PrivacyPreferences(context)
+            assertEquals(enabled, preferences.state.value.hideContent)
+            assertFalse(preferences.state.value.preventScreenshots)
+            preferences.save(enabled, true, setOf("shop"), 7, preventScreenshots = true)
+            assertTrue(PrivacyPreferences(context).state.value.preventScreenshots)
+            assertEquals(enabled, PrivacyPreferences(context).state.value.hideContent)
+            // Existing call sites that omit the new option must preserve the user's choice.
+            preferences.save(!enabled, true, setOf("shop"), 30)
+            assertTrue(preferences.state.value.preventScreenshots)
+            preferences.save(!enabled, true, setOf("shop"), 30, preventScreenshots = false)
+            assertFalse(PrivacyPreferences(context).state.value.preventScreenshots)
+        }
+    }
+
+    @Test fun foregroundViewingDoesNotExpireAndNewInstancesStillStartLocked() {
         var time = 1L
         val session = ContentSession { time }
         assertFalse(session.isUnlocked())
         session.unlock()
         assertTrue(session.isUnlocked())
-        time += 120_000
-        assertFalse(session.isUnlocked())
+        time += 24 * 60 * 60_000L
+        assertTrue(session.isUnlocked())
+        assertTrue(session.unlocked.value)
         session.unlock(); session.lock()
         assertFalse(session.isUnlocked())
         assertFalse(ContentSession { time }.isUnlocked())
+    }
+
+    @Test fun shortBackgroundSwitchReturnsToAnUnexpiredForegroundSession() {
+        var time = 10L
+        val session = ContentSession { time }
+        session.unlock()
+        session.enterBackground()
+        time += 59_999L
+        assertTrue(session.isUnlocked())
+        session.enterForeground()
+        time += 24 * 60 * 60_000L
+        assertTrue(session.isUnlocked())
+        // Each real departure starts a new grace period, regardless of time spent in foreground.
+        session.enterBackground()
+        time += 59_999L
+        assertTrue(session.isUnlocked())
+        time++
+        assertFalse(session.isUnlocked())
+        assertFalse(session.unlocked.value)
+    }
+
+    @Test fun backgroundChecksAndDuplicateCallbacksNeverRefreshTheDeadline() {
+        var time = 0L
+        val session = ContentSession { time }
+        session.unlock(); session.enterBackground()
+        repeat(5) {
+            time += 10_000L
+            assertTrue(session.isUnlocked())
+            session.enterBackground()
+        }
+        time = 60_000L
+        assertFalse(session.isUnlocked())
+        session.enterForeground()
+        assertFalse(session.isUnlocked())
+    }
+
+    @Test fun foregroundReturnChecksExpiryEvenWhenNoBackgroundTimerRan() {
+        var time = 0L
+        val session = ContentSession { time }
+        session.unlock(); session.enterBackground()
+        time = 60_000L
+        session.enterForeground()
+        assertFalse(session.isUnlocked())
+        assertFalse(session.unlocked.value)
+    }
+
+    @Test fun explicitUnlockWhileBackgroundStillHasABoundedGracePeriod() {
+        var time = 0L
+        val session = ContentSession { time }
+        session.enterBackground()
+        time = 120_000L
+        session.unlock()
+        time += 59_999L
+        assertTrue(session.isUnlocked())
+        time++
+        assertFalse(session.isUnlocked())
+    }
+
+    @Test fun explicitScreenLockRevokesImmediatelyInForegroundAndDuringGrace() {
+        var time = 0L
+        val session = ContentSession { time }
+        session.unlock(); session.lock()
+        assertFalse(session.isUnlocked())
+        session.unlock(); session.enterBackground()
+        time = 1L
+        session.lock(); session.enterForeground()
+        assertFalse(session.isUnlocked())
+        assertFalse(session.unlocked.value)
     }
 }

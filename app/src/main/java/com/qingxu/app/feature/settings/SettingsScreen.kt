@@ -27,7 +27,7 @@ fun SettingsScreen(
     onPrivacySettings: () -> Unit,
     onAdvancedSettings: () -> Unit,
     onRestartGuide: () -> Unit,
-    hideContent: Boolean = true,
+    hideContent: Boolean = false,
     guideStep: Int? = null,
     surfaceSettings: SurfaceSettings = SurfaceSettings(),
     onSurfaceChange: (Boolean, Boolean) -> Unit = { _, _ -> },
@@ -47,7 +47,7 @@ fun SettingsScreen(
                         else -> "${state.selectedPackages.size} 个应用 · 已连接"
                     }, Icons.Outlined.Apps, onSources, highlighted = guideStep == 0 || guideStep == 1)
                     HorizontalDivider(Modifier.padding(horizontal = 20.dp))
-                    SettingsDestination("隐私保护", if (hideContent) "解锁后查看消息" else "消息内容直接显示",
+                    SettingsDestination("隐私保护", if (hideContent) "应用锁已开启" else "应用锁、截图与上传限制",
                         Icons.Outlined.Lock, onPrivacySettings)
                 }
             }

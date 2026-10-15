@@ -12,36 +12,41 @@ val DEFAULT_LOCAL_ONLY_PACKAGES = setOf(
 )
 
 data class PrivacySettings(
-    val hideContent: Boolean = true,
+    val hideContent: Boolean = false,
     val blockCloudWhenLocked: Boolean = true,
     val localOnlyPackages: Set<String> = DEFAULT_LOCAL_ONLY_PACKAGES,
     // An upgrade must never silently delete existing history.
     val retentionDays: Int = 0,
     val revision: Long = 0,
     val deletedBefore: Long = 0,
+    val preventScreenshots: Boolean = false,
 )
 
 class PrivacyPreferences(context: Context) {
     private val prefs = context.applicationContext.getSharedPreferences("privacy", Context.MODE_PRIVATE)
     private val mutableState = MutableStateFlow(PrivacySettings(
-        hideContent = prefs.getBoolean("hide_content", true),
+        hideContent = prefs.getBoolean("hide_content", false),
         blockCloudWhenLocked = prefs.getBoolean("block_cloud_locked", true),
         localOnlyPackages = prefs.getStringSet("local_only", DEFAULT_LOCAL_ONLY_PACKAGES).orEmpty().toSet(),
         retentionDays = prefs.getInt("retention_days", 0).takeIf { it in setOf(0, 7, 30) } ?: 0,
         revision = prefs.getLong("revision", 0),
         deletedBefore = prefs.getLong("deleted_before", 0),
+        preventScreenshots = prefs.getBoolean("prevent_screenshots", false),
     ))
     val state = mutableState.asStateFlow()
 
     @Synchronized
-    fun save(hideContent: Boolean, blockCloudWhenLocked: Boolean, localOnlyPackages: Set<String>, retentionDays: Int) {
+    fun save(hideContent: Boolean, blockCloudWhenLocked: Boolean, localOnlyPackages: Set<String>, retentionDays: Int,
+        preventScreenshots: Boolean = mutableState.value.preventScreenshots) {
         require(retentionDays in setOf(0, 7, 30)) { "请选择支持的保留期限" }
         val next = mutableState.value.copy(hideContent = hideContent, blockCloudWhenLocked = blockCloudWhenLocked,
-            localOnlyPackages = localOnlyPackages.toSet(), retentionDays = retentionDays)
+            localOnlyPackages = localOnlyPackages.toSet(), retentionDays = retentionDays,
+            preventScreenshots = preventScreenshots)
         if (next == mutableState.value) return
         val revision = next.revision + 1
         check(prefs.edit().putBoolean("hide_content", hideContent).putBoolean("block_cloud_locked", blockCloudWhenLocked)
             .putStringSet("local_only", localOnlyPackages.toSet()).putInt("retention_days", retentionDays)
+            .putBoolean("prevent_screenshots", preventScreenshots)
             .putLong("revision", revision).commit())
         mutableState.value = next.copy(revision = revision)
     }

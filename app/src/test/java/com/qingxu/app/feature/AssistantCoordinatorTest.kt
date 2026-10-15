@@ -47,7 +47,7 @@ class AssistantCoordinatorTest {
         initial: List<NotificationEntry> = listOf(entry("one")),
         allowed: Set<String> = setOf(packageName),
         selected: Set<String> = setOf(packageName),
-        privacySettings: PrivacySettings = PrivacySettings(),
+        privacySettings: PrivacySettings = PrivacySettings(hideContent = true),
         provider: AiProvider = AiProvider.CHAT_COMPLETIONS,
     ) {
         val dispatcher = QueuedDispatcher()
@@ -150,6 +150,55 @@ class AssistantCoordinatorTest {
             assertEquals(0, it.connectionReads)
             assertTrue(it.requests.isEmpty())
             assertTrue(it.state.status.contains("暂无可分析"))
+        }
+    }
+
+    @Test fun optionalLockDisabledAllowsAssistantWithoutAnUnlockedContentSession() {
+        use(Harness(privacySettings = PrivacySettings(hideContent = false))) { h ->
+            h.sessionValid = false
+            h.unlocked.value = false
+            h.drain()
+            assertFalse(h.state.concealed)
+            h.answer = { AssistantReply("建议优先查看", listOf(AssistantChange("n1", AssistantAction.PRIORITIZE))) }
+            h.send()
+            assertEquals(1, h.requests.size)
+            assertNotNull(h.state.proposal)
+            h.coordinator.apply(); h.drain()
+            assertEquals(UserLabel.IMPORTANT_URGENT, h.rows.getValue("one").userLabel)
+            assertTrue(h.state.canUndo)
+            assertFalse(h.state.concealed)
+            assertFalse(h.sessionValid)
+        }
+    }
+
+    @Test fun optionalLockDisabledStillRespectsTheSeparateScreenLockCloudPolicy() {
+        listOf(true, false).forEach { blockCloud ->
+            use(Harness(privacySettings = PrivacySettings(hideContent = false, blockCloudWhenLocked = blockCloud))) { h ->
+                h.sessionValid = false
+                h.unlocked.value = false
+                h.deviceLocked = true
+                h.drain()
+                assertFalse(h.state.concealed)
+                h.send()
+                assertEquals(if (blockCloud) 0 else 1, h.requests.size)
+                assertEquals(if (blockCloud) 0 else 1, h.connectionReads)
+                assertFalse(h.state.running)
+            }
+        }
+        use(Harness(privacySettings = PrivacySettings(hideContent = false, blockCloudWhenLocked = true))) { h ->
+            h.sessionValid = false
+            h.unlocked.value = false
+            h.drain()
+            val release = CompletableDeferred<Unit>()
+            h.beforeReply = { release.await() }
+            h.send()
+            assertTrue(h.state.running)
+            h.deviceLocked = true
+            release.complete(Unit); h.drain()
+            assertTrue(h.state.messages.isEmpty())
+            assertNull(h.state.proposal)
+            assertFalse(h.state.running)
+            assertFalse(h.state.concealed)
         }
     }
 

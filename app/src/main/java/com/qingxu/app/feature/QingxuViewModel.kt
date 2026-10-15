@@ -425,6 +425,22 @@ class QingxuViewModel internal constructor(application: Application, private val
 
     fun lockContent() { container.contentSession.lock(); assistant.clear() }
     fun unlockContent() { container.contentSession.unlock() }
+    private var backgroundLock: Job? = null
+    fun contentForeground() {
+        backgroundLock?.cancel(); backgroundLock = null
+        container.contentSession.enterForeground()
+    }
+    fun contentBackground() {
+        container.contentSession.enterBackground()
+        assistant.clear()
+        connectionDraftChanged()
+        if (backgroundLock?.isActive == true) return
+        backgroundLock = viewModelScope.launch {
+            kotlinx.coroutines.delay(60_000)
+            container.contentSession.isUnlocked()
+        }
+    }
+    fun hasContentAccess(): Boolean = !container.privacy.state.value.hideContent || container.contentSession.isUnlocked()
     fun expireContentSession() { container.contentSession.isUnlocked() }
     private fun requirePrivateAccess(): Boolean {
         if (!container.privacy.state.value.hideContent || container.contentSession.isUnlocked()) return true
@@ -432,19 +448,33 @@ class QingxuViewModel internal constructor(application: Application, private val
         return false
     }
 
-    fun savePrivacy(hideContent: Boolean, blockCloudWhenLocked: Boolean, localOnlyPackages: Set<String>, retentionDays: Int) {
+    fun savePrivacy(hideContent: Boolean, blockCloudWhenLocked: Boolean, localOnlyPackages: Set<String>, retentionDays: Int,
+        preventScreenshots: Boolean = container.privacy.state.value.preventScreenshots) {
         if (!requirePrivateAccess()) return
+        if (hideContent && !container.contentSession.isUnlocked()) {
+            messageChannel.trySend("开启应用锁前，请先验证身份")
+            return
+        }
         write {
             container.processor.gate.withLock {
-                if (!requirePrivateAccess()) return@write
-                withContext(Dispatchers.IO) { container.privacy.save(hideContent, blockCloudWhenLocked, localOnlyPackages, retentionDays) }
-                container.processor.invalidatePolicy()
-                container.dao.requeueForPackages(container.sources.selected.value.toList())
+                if (!requirePrivateAccess() || (hideContent && !container.contentSession.isUnlocked())) return@write
+                val before = container.privacy.state.value
+                val saved = withContext(Dispatchers.IO) {
+                    if (!hasContentAccess() || (hideContent && !container.contentSession.isUnlocked())) false
+                    else {
+                        container.privacy.save(hideContent, blockCloudWhenLocked, localOnlyPackages, retentionDays, preventScreenshots)
+                        true
+                    }
+                }
+                if (!saved) return@write
+                if (before.blockCloudWhenLocked != blockCloudWhenLocked || before.localOnlyPackages != localOnlyPackages) {
+                    container.processor.invalidatePolicy()
+                    container.dao.requeueForPackages(container.sources.selected.value.toList())
+                    AnalysisScheduler.enqueue(getApplication())
+                }
                 container.maintainStorage()
             }
-            if (hideContent) lockContent()
-            mutablePrivacyStatus.value = "隐私设置已保存。已发出的请求无法撤回；后续请求按新设置处理。"
-            AnalysisScheduler.enqueue(getApplication())
+            mutablePrivacyStatus.value = "已保存，查看保护与云端上传分别生效"
         }
     }
 

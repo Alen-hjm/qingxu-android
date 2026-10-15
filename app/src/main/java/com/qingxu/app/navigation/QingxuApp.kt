@@ -31,7 +31,8 @@ import com.qingxu.app.feature.onboarding.OnboardingExample
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun QingxuApp(viewModel: QingxuViewModel, onUnlock: () -> Unit = {}, onPermissionSettings: () -> Unit,
-    onNotificationPermission: (Boolean, () -> Unit) -> Unit = { _, action -> action() }) {
+    onNotificationPermission: (Boolean, () -> Unit) -> Unit = { _, action -> action() },
+    onAuthenticate: (() -> Unit) -> Unit = { onUnlock() }) {
     val state by viewModel.state.collectAsStateWithLifecycle()
     val onboarding by viewModel.onboarding.collectAsStateWithLifecycle()
     val ai by viewModel.aiSettings.collectAsStateWithLifecycle()
@@ -122,7 +123,14 @@ fun QingxuApp(viewModel: QingxuViewModel, onUnlock: () -> Unit = {}, onPermissio
                     onPrivacySettings = { page = 4 }, testStatus = connectionTest, onConnectionChanged = viewModel::connectionDraftChanged,
                     localOnlyPackages = privacy.localOnlyPackages)
                 4 -> if (concealed) PrivateSettingsGate(onUnlock) else PrivacySettingsScreen(privacy, state.sourceApps,
-                    state.selectedPackages, privacyStatus, viewModel::savePrivacy, viewModel::deleteHistory, cloudEnabled = ai.enabled)
+                    state.selectedPackages, privacyStatus, { hide, locked, local, days, screenshots ->
+                        val revision = privacy.revision
+                        val save = {
+                            if (viewModel.privacySettings.value.revision == revision)
+                                viewModel.savePrivacy(hide, locked, local, days, screenshots)
+                        }
+                        if (hide && !privacy.hideContent) onAuthenticate(save) else save()
+                    }, viewModel::deleteHistory, cloudEnabled = ai.enabled)
                 5 -> SourceSettingsScreen(state, onPermissionSettings, { packageName, selected ->
                     if (selected && concealed) onUnlock() else viewModel.selectSource(packageName, selected)
                 }, guideStep = if (guiding) guideStep else null, requiresUnlock = concealed, onUnlock = onUnlock,
@@ -143,7 +151,7 @@ fun QingxuApp(viewModel: QingxuViewModel, onUnlock: () -> Unit = {}, onPermissio
 private fun PrivateSettingsGate(onUnlock: () -> Unit) {
     Column(Modifier.fillMaxSize().padding(24.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
         Text("先验证，再查看与修改", style = MaterialTheme.typography.headlineSmall)
-        Text("使用手机锁屏密码验证，查看私密设置。")
+        Text("使用系统生物识别或锁屏密码验证，查看私密设置。")
         Button(onClick = onUnlock) { Text("验证身份") }
     }
 }

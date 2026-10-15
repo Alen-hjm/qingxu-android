@@ -37,6 +37,18 @@ class QingxuApplication : Application(), Configuration.Provider {
     val container by lazy { AppContainer(this) }
     override fun onCreate() {
         super.onCreate()
+        val screenLockReceiver = object : android.content.BroadcastReceiver() {
+            override fun onReceive(context: android.content.Context?, intent: android.content.Intent?) {
+                if (intent?.action == android.content.Intent.ACTION_SCREEN_OFF) container.contentSession.lock()
+            }
+        }
+        val screenLockFilter = android.content.IntentFilter(android.content.Intent.ACTION_SCREEN_OFF)
+        if (android.os.Build.VERSION.SDK_INT >= 33) registerReceiver(screenLockReceiver, screenLockFilter, RECEIVER_NOT_EXPORTED)
+        else {
+            // ACTION_SCREEN_OFF is a protected system broadcast; no app-defined permission is needed.
+            @Suppress("DEPRECATION")
+            registerReceiver(screenLockReceiver, screenLockFilter)
+        }
         NotificationConnectionRecovery.install(this)
         AnalysisScheduler.installRepair(this)
         AnalysisScheduler.enqueue(this)

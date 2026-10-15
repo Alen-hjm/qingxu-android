@@ -69,7 +69,10 @@ class NotificationSurface(
         val manager = context.getSystemService(NotificationManager::class.java) ?: return
         if (count == 0 || !manager.areNotificationsEnabled()) { manager.cancel(SUMMARY_ID); return }
         manager.createNotificationChannel(NotificationChannel(SUMMARY_CHANNEL, "优先消息摘要", NotificationManager.IMPORTANCE_LOW))
-        val intent = PendingIntent.getActivity(context, 0, Intent(context, MainActivity::class.java), PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+        // Reuse the current task/Activity: a second instance must not start a competing lock timer.
+        val activityIntent = Intent(context, MainActivity::class.java)
+            .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+        val intent = PendingIntent.getActivity(context, 0, activityIntent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
         manager.notify(SUMMARY_ID, Notification.Builder(context, SUMMARY_CHANNEL)
             .setSmallIcon(R.drawable.qingxu_notification).setContentTitle("轻序 · 有 $count 条消息优先看")
             .setContentText("点开查看整理结果").setContentIntent(intent).setOnlyAlertOnce(true)

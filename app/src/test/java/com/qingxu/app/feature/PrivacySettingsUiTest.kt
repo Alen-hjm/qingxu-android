@@ -37,11 +37,12 @@ class PrivacySettingsUiTest {
         var saved: SavedPrivacy? = null
         val privateSources = setOf("com.tencent.mm", "com.android.mms")
         compose.setContent { QingxuTheme { Surface {
-            PrivacySettingsScreen(PrivacySettings(localOnlyPackages = privateSources), apps, selected, "", onSave = { hide, locked, local, days ->
-                saved = SavedPrivacy(hide, locked, local, days)
+            PrivacySettingsScreen(PrivacySettings(localOnlyPackages = privateSources), apps, selected, "", onSave = { hide, locked, local, days, screenshots ->
+                saved = SavedPrivacy(hide, locked, local, days, screenshots)
             }, onDeleteAll = {})
         } } }
-        compose.onNodeWithContentDescription("保护通知正文").assertIsOn()
+        compose.onNodeWithContentDescription("应用锁").assertIsOff()
+        compose.onNodeWithContentDescription("防止截图与录屏").assertIsOff()
         compose.onNodeWithContentDescription("锁屏时阻止云端分析").assertDoesNotExist()
         compose.onNodeWithText("微信").assertDoesNotExist()
         compose.onNodeWithText("购物应用").assertDoesNotExist()
@@ -55,6 +56,7 @@ class PrivacySettingsUiTest {
         compose.onNodeWithText("保存设置").assertIsNotEnabled()
         scrollToText("微信")
         compose.onNodeWithContentDescription("微信仅本机处理").assertIsOn()
+        scrollToText("购物应用")
         compose.onNodeWithContentDescription("购物应用仅本机处理").assertIsOff().performClick()
         scrollToText("历史保留")
         compose.onNodeWithText("历史保留").performClick()
@@ -63,7 +65,8 @@ class PrivacySettingsUiTest {
         compose.runOnIdle { assertNull(saved) }
         compose.onNodeWithText("保存设置").assertIsDisplayed().performClick()
         compose.runOnIdle {
-            assertTrue(saved!!.hide)
+            assertFalse(saved!!.hide)
+            assertFalse(saved!!.screenshots)
             assertTrue(saved!!.locked)
             assertEquals(privateSources + "shop.example", saved!!.local)
             assertEquals(30, saved!!.days)
@@ -73,7 +76,7 @@ class PrivacySettingsUiTest {
     @Test fun deleteHistoryRequiresExplicitSecondActionAndCanBeCancelled() {
         var deleteCalls = 0
         compose.setContent { QingxuTheme { Surface {
-            PrivacySettingsScreen(PrivacySettings(), apps, selected, "", { _, _, _, _ -> }, { deleteCalls++ })
+            PrivacySettingsScreen(PrivacySettings(), apps, selected, "", { _, _, _, _, _ -> }, { deleteCalls++ })
         } } }
         scrollToText("删除全部本机历史")
         compose.onNodeWithText("删除全部本机历史").performClick()
@@ -93,10 +96,12 @@ class PrivacySettingsUiTest {
             CompositionLocalProvider(LocalDensity provides Density(density.density, 1.8f)) {
                 QingxuTheme { Surface {
                     PrivacySettingsScreen(PrivacySettings(localOnlyPackages = setOf("com.tencent.mm")), apps, selected, "",
-                        { hide, locked, local, days -> saved = SavedPrivacy(hide, locked, local, days) }, {}, cloudEnabled = true)
+                        { hide, locked, local, days, screenshots -> saved = SavedPrivacy(hide, locked, local, days, screenshots) }, {}, cloudEnabled = true)
                 } }
             }
         }
+        scrollToText("防止截图与录屏")
+        compose.onNodeWithContentDescription("防止截图与录屏").assertIsDisplayed().assertIsOff().performClick()
         scrollToText("云端隐私")
         compose.onNodeWithText("云端已启用 · 查看上传限制").assertExists()
         compose.onNodeWithText("云端隐私").performClick()
@@ -118,7 +123,49 @@ class PrivacySettingsUiTest {
             assertFalse(saved!!.locked)
             assertEquals(7, saved!!.days)
             assertTrue("com.tencent.mm" in saved!!.local)
+            assertTrue(saved!!.screenshots)
         }
+    }
+
+    @Test fun appLockAndScreenshotProtectionAreIndependentSavedChoices() {
+        var saved: SavedPrivacy? = null
+        compose.setContent { QingxuTheme { Surface {
+            PrivacySettingsScreen(PrivacySettings(), apps, selected, "", { hide, locked, local, days, screenshots ->
+                saved = SavedPrivacy(hide, locked, local, days, screenshots)
+            }, {})
+        } } }
+        compose.onNodeWithContentDescription("应用锁").assertIsOff().performClick().assertIsOn()
+        compose.onNodeWithContentDescription("防止截图与录屏").assertIsOff()
+        compose.runOnIdle { assertNull(saved) }
+        compose.onNodeWithText("保存设置").performClick()
+        compose.runOnIdle {
+            assertTrue(saved!!.hide)
+            assertFalse(saved!!.screenshots)
+            assertTrue(saved!!.locked)
+            assertEquals(PrivacySettings().localOnlyPackages, saved!!.local)
+        }
+        compose.onNodeWithContentDescription("应用锁").performClick().assertIsOff()
+        compose.onNodeWithContentDescription("防止截图与录屏").performClick().assertIsOn()
+        compose.onNodeWithText("保存设置").performClick()
+        compose.runOnIdle {
+            assertFalse(saved!!.hide)
+            assertTrue(saved!!.screenshots)
+            assertTrue(saved!!.locked)
+        }
+    }
+
+    @Test fun existingProtectionChoicesRemainEnabledUntilExplicitlyChanged() {
+        var saved: SavedPrivacy? = null
+        compose.setContent { QingxuTheme { Surface {
+            PrivacySettingsScreen(PrivacySettings(hideContent = true, preventScreenshots = true), apps, selected, "",
+                { hide, locked, local, days, screenshots -> saved = SavedPrivacy(hide, locked, local, days, screenshots) }, {})
+        } } }
+        compose.onNodeWithContentDescription("应用锁").assertIsOn()
+        compose.onNodeWithContentDescription("防止截图与录屏").assertIsOn()
+        compose.onNodeWithText("保存设置").assertIsNotEnabled()
+        compose.onNodeWithContentDescription("防止截图与录屏").performClick()
+        compose.onNodeWithText("保存设置").performClick()
+        compose.runOnIdle { assertTrue(saved!!.hide); assertFalse(saved!!.screenshots) }
     }
 
     private fun scrollToText(text: String) {
@@ -137,5 +184,6 @@ class PrivacySettingsUiTest {
         }
     }
 
-    private data class SavedPrivacy(val hide: Boolean, val locked: Boolean, val local: Set<String>, val days: Int)
+    private data class SavedPrivacy(val hide: Boolean, val locked: Boolean, val local: Set<String>, val days: Int,
+        val screenshots: Boolean)
 }

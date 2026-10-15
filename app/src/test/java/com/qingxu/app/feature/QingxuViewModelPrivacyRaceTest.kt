@@ -17,7 +17,10 @@ import com.qingxu.app.AppContainer
 import com.qingxu.app.core.ai.AiAuthMode
 import com.qingxu.app.core.ai.AiEndpointMode
 import com.qingxu.app.core.ai.AiProvider
+import com.qingxu.app.core.ai.AiSettings
 import com.qingxu.app.core.privacy.AesGcmNotificationCipher
+import com.qingxu.app.core.privacy.CloudPermission
+import com.qingxu.app.core.privacy.CloudPrivacyGate
 import com.qingxu.app.core.processing.AnalysisScheduler
 import com.qingxu.app.data.local.NotificationEntry
 import com.qingxu.app.data.local.QingxuDatabase
@@ -27,6 +30,8 @@ import com.qingxu.app.data.local.SourceKindRule
 import com.qingxu.app.data.local.UserLabel
 import com.qingxu.app.notification.SurfaceSettings
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.withTimeout
 import org.junit.After
 import org.junit.Assert.*
 import org.junit.Before
@@ -59,6 +64,7 @@ class QingxuViewModelPrivacyRaceTest {
     @Before fun setup() = runBlocking {
         application = ApplicationProvider.getApplicationContext()
         container = AppContainer(application)
+        container.privacy.save(true, true, container.privacy.state.value.localOnlyPackages, 0)
         container.dao.configureCipher(AesGcmNotificationCipher { SecretKeySpec(ByteArray(32) { 4 }, "AES") })
         container.ensureStorageReady()
         container.sources.setSelected(chat.packageName, true)
@@ -150,6 +156,80 @@ class QingxuViewModelPrivacyRaceTest {
         assertEquals(persistedChat, container.dao.find(chat.notificationKey))
         assertEquals(persistedPromotion, container.dao.find(promotion.notificationKey))
         assertNoAnalysisScheduled()
+    }
+
+    @Test fun enablingOptionalLockRequiresAuthenticationEvenWhenViewingIsAllowed() {
+        val localOnly = container.privacy.state.value.localOnlyPackages
+        container.privacy.save(false, true, localOnly, 0)
+        viewModel.lockContent()
+        assertTrue(viewModel.hasContentAccess())
+        assertFalse(container.contentSession.isUnlocked())
+        val before = container.privacy.state.value
+        viewModel.savePrivacy(true, true, localOnly, 0)
+        shadowOf(Looper.getMainLooper()).idle()
+        assertEquals(before, container.privacy.state.value)
+        assertFalse(container.privacy.state.value.hideContent)
+        assertNoAnalysisScheduled()
+    }
+
+    @Test fun authenticatedOptInKeepsTheCurrentSessionUnlockedAndDoesNotRequeueMessages() = runBlocking {
+        val localOnly = container.privacy.state.value.localOnlyPackages
+        container.privacy.save(false, true, localOnly, 0)
+        viewModel.lockContent()
+        viewModel.unlockContent()
+        viewModel.savePrivacy(true, true, localOnly, 0)
+        awaitSuccessfulPrivacySave()
+        assertTrue(container.privacy.state.value.hideContent)
+        assertTrue(container.contentSession.isUnlocked())
+        assertTrue(viewModel.hasContentAccess())
+        assertEquals(persistedChat, container.dao.find(chat.notificationKey))
+        assertEquals(persistedPromotion, container.dao.find(promotion.notificationKey))
+        assertEquals(0L, container.processor.policyGeneration)
+        assertNoAnalysisScheduled()
+    }
+
+    @Test fun enablingOptionalLockRechecksAuthenticationAfterWaitingForProcessorGate() {
+        val localOnly = container.privacy.state.value.localOnlyPackages
+        container.privacy.save(false, true, localOnly, 0)
+        val before = container.privacy.state.value
+        whileGateHeldThenLock({ viewModel.savePrivacy(true, true, localOnly, 0) })
+        assertEquals(before, container.privacy.state.value)
+        assertFalse(container.privacy.state.value.hideContent)
+        assertTrue(viewModel.hasContentAccess())
+        assertNoAnalysisScheduled()
+    }
+
+    @Test fun changingScreenshotProtectionDoesNotReclassifyMessagesOrChangeCloudPermission() = runBlocking {
+        val localOnly = container.privacy.state.value.localOnlyPackages
+        container.privacy.save(false, true, localOnly, 0, preventScreenshots = false)
+        viewModel.lockContent()
+        val before = container.privacy.state.value
+        val beforeAi = container.ai.state.value
+        val cloud = AiSettings(enabled = true, allowedPackages = setOf(promotion.packageName))
+        assertEquals(CloudPermission.ALLOWED, CloudPrivacyGate.permission(promotion, cloud, before, false))
+        viewModel.savePrivacy(false, true, localOnly, 0, preventScreenshots = true)
+        awaitSuccessfulPrivacySave()
+        val after = container.privacy.state.value
+        assertTrue(after.preventScreenshots)
+        assertFalse(after.hideContent)
+        assertFalse(container.contentSession.isUnlocked())
+        assertTrue(viewModel.hasContentAccess())
+        assertEquals(before.copy(revision = after.revision, preventScreenshots = true), after)
+        assertEquals(beforeAi, container.ai.state.value)
+        assertEquals(CloudPermission.ALLOWED, CloudPrivacyGate.permission(promotion, cloud, after, false))
+        assertEquals(CloudPermission.LOCKED, CloudPrivacyGate.permission(promotion, cloud, after, true))
+        assertEquals(persistedChat, container.dao.find(chat.notificationKey))
+        assertEquals(persistedPromotion, container.dao.find(promotion.notificationKey))
+        assertEquals(0L, container.processor.policyGeneration)
+        assertNoAnalysisScheduled()
+    }
+
+    private suspend fun awaitSuccessfulPrivacySave() = withTimeout(10_000) {
+        while (!viewModel.privacyStatus.value.startsWith("已保存")) {
+            shadowOf(Looper.getMainLooper()).idle()
+            delay(1)
+        }
+        shadowOf(Looper.getMainLooper()).idle()
     }
 
     private fun whileGateHeldThenLock(vararg actions: () -> Unit) {

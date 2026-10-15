@@ -163,8 +163,8 @@ class GuidedUiTest {
         capture("app-first-open")
         compose.onNodeWithText("设置", substring = false).performClick()
         compose.onNodeWithText("整理哪些应用").performClick()
-        compose.onNodeWithText("↓ 先解锁，再选择应用").assertExists()
-        compose.onNodeWithText("解锁后选择应用").assertExists()
+        compose.onNodeWithText("↓ 选一个常用应用").assertExists()
+        compose.onNodeWithText("解锁后选择应用").assertDoesNotExist()
         compose.onNodeWithText("搜索应用").assertExists()
         compose.onNodeWithContentDescription("返回设置").performClick()
         compose.onNodeWithText("搜索应用").assertDoesNotExist()
@@ -175,12 +175,8 @@ class GuidedUiTest {
         compose.onNodeWithText("API 密钥").assertDoesNotExist()
         compose.onNodeWithText("搜索应用").assertDoesNotExist()
         compose.onNodeWithContentDescription("高级设置").performScrollTo().performClick()
-        compose.onNodeWithText("先验证，再查看与修改").assertExists()
-        compose.onNodeWithText("云端分析（可选）").assertDoesNotExist()
-        compose.onNodeWithText("验证身份").performClick()
-        compose.runOnIdle { assertEquals(1, unlockRequests) }
-        compose.onNodeWithText("云端分析（可选）").assertDoesNotExist()
-        compose.runOnIdle { appViewModel.unlockContent() }
+        compose.onNodeWithText("先验证，再查看与修改").assertDoesNotExist()
+        compose.runOnIdle { assertEquals(0, unlockRequests) }
         compose.onNodeWithText("云端分析（可选）").assertExists()
         compose.onNodeWithContentDescription("返回设置").performClick()
         compose.onNode(hasScrollToIndexAction()).performScrollToNode(hasText("重新体验操作引导"))
